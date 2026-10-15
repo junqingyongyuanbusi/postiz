@@ -1,5 +1,11 @@
 {
   "calendar": "日历",
+  "reject_post": "不通过",
+  "rejected": "不通过",
+  "reject_post_in_all_channels_question": "仅将当前渠道标记为不通过，还是将所有已选择的新帖和符合条件的草稿标记为不通过？已有排期、发布失败、已发布、不符合条件的草稿及未选择的渠道不会改变。",
+  "reject_selected_unpublished_channels_question": "将所有已选择的新帖和符合条件的草稿标记为不通过？已有排期、发布失败、已发布、不符合条件的草稿及未选择的渠道不会改变。",
+  "reject_all_unpublished_channels": "所有新帖和符合条件的草稿均不通过",
+  "no_posts_to_save": "没有符合条件的帖子可保存",
   "webhooks": "Webhook（网络钩子）",
   "webhooks_are_a_way_to_get_notified_when_something_happens_in_postiz_via_an_http_request": "Webhook 是一种通过 HTTP 请求在 Postiz 中有事件发生时获得通知的方式。",
   "name": "名称",

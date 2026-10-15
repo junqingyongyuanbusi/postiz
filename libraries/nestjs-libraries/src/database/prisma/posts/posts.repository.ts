@@ -1,10 +1,19 @@
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
-import { Injectable } from '@nestjs/common';
+import {
+  PrismaRepository,
+  PrismaTransaction,
+} from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+} from '@nestjs/common';
 import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import {
   APPROVED_SUBMIT_FOR_ORDER,
   CreationMethod,
   Post,
+  PostSaveAction,
+  Prisma,
   State,
 } from '@prisma/client';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
@@ -30,7 +39,8 @@ export class PostsRepository {
     private _comments: PrismaRepository<'comments'>,
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
-    private _errors: PrismaRepository<'errors'>
+    private _errors: PrismaRepository<'errors'>,
+    private _transaction: PrismaTransaction
   ) {}
 
   searchForMissingThreeHoursPosts() {
@@ -199,6 +209,7 @@ export class PostsRepository {
         releaseId: true,
         state: true,
         error: true,
+        saveAction: true,
         intervalInDays: true,
         group: true,
         creationMethod: true,
@@ -323,6 +334,7 @@ export class PostsRepository {
           releaseURL: true,
           releaseId: true,
           state: true,
+          saveAction: true,
           intervalInDays: true,
           group: true,
           creationMethod: true,
@@ -508,7 +520,30 @@ export class PostsRepository {
   }
 
   async changeState(id: string, state: State, err?: any, body?: any) {
-    const update = await this._post.model.post.update({
+    if (state === 'ERROR') {
+      const result = await this._post.model.post.updateMany({
+        where: {
+          id,
+          OR: [
+            { saveAction: null },
+            { saveAction: { not: PostSaveAction.pass } },
+            { state: { not: State.DRAFT } },
+          ],
+        },
+        data: {
+          state,
+          ...(err ? { error: typeof err === 'string' ? err : JSON.stringify(err) } : {}),
+        },
+      });
+      if (!result.count) {
+        return this._post.model.post.findUniqueOrThrow({
+          where: { id },
+          include: { integration: { select: { providerIdentifier: true } } },
+        });
+      }
+    }
+    const include = { integration: { select: { providerIdentifier: true } } } as const;
+    const update = state !== 'ERROR' ? await this._post.model.post.update({
       where: {
         id,
       },
@@ -518,14 +553,8 @@ export class PostsRepository {
           ? { error: typeof err === 'string' ? err : JSON.stringify(err) }
           : {}),
       },
-      include: {
-        integration: {
-          select: {
-            providerIdentifier: true,
-          },
-        },
-      },
-    });
+      include,
+    }) : await this._post.model.post.findUniqueOrThrow({ where: { id }, include });
 
     if (state === 'ERROR' && err && body) {
       try {
@@ -553,31 +582,84 @@ export class PostsRepository {
     });
   }
 
+  changePostStatus(orgId: string, id: string, status: 'draft' | 'schedule') {
+    return this.updatePostChain(orgId, id, status);
+  }
+
   async changeDate(
     orgId: string,
     id: string,
     date: string,
-    isDraft: boolean,
-    action: 'schedule' | 'update' = 'schedule'
+    _isDraft: boolean,
+    action: 'schedule' | 'update' = 'schedule',
+    republish = false
   ) {
-    return this._post.model.post.update({
-      where: {
-        organizationId: orgId,
-        id,
-      },
-      data: {
-        publishDate: dayjs(date).toDate(),
-        // schedule: set state to QUEUE (or DRAFT if it was a draft)
-        // update: don't change the state
-        ...(action === 'schedule'
-          ? {
-              state: isDraft ? 'DRAFT' : 'QUEUE',
-              releaseId: null,
-              releaseURL: null,
-            }
-          : {}),
-      },
-    });
+    // Read the draft state inside the transaction rather than trusting isDraft.
+    return this.updatePostChain(orgId, id, action, date, republish);
+  }
+
+  private updatePostChain(
+    orgId: string,
+    id: string,
+    action: 'draft' | 'schedule' | 'update',
+    date?: string,
+    republish = false
+  ) {
+    return this._transaction.model.$transaction(async (transaction) => {
+      const root = await transaction.post.findFirst({
+        where: { id, organizationId: orgId, deletedAt: null, parentPostId: null },
+      });
+      if (!root) {
+        throw new BadRequestException('Post root not found');
+      }
+      const [posts] = await this.validatePostTargets(orgId, [{
+        integration: { id: root.integrationId },
+        group: root.group,
+        value: [],
+      } as PostBody], transaction);
+      const changesState = action !== 'update';
+      const resetsRelease = date !== undefined && changesState;
+      const staysDraft = action === 'draft' || (date !== undefined && root.state === State.DRAFT);
+      const protectPublished = resetsRelease && (staysDraft || !republish);
+      if (protectPublished && posts.some((post) => post.state === State.PUBLISHED || post.releaseId || post.releaseURL)) {
+        throw new ConflictException('Published post results cannot be reset through a status or scheduling change');
+      }
+      const data = {
+        saveAction: action === 'update' ? PostSaveAction.update : staysDraft ? PostSaveAction.draft : PostSaveAction.schedule,
+        ...(date !== undefined ? { publishDate: dayjs(date).toDate() } : {}),
+        ...(changesState ? { state: staysDraft ? State.DRAFT : State.QUEUE } : {}),
+        ...(resetsRelease ? {
+          releaseId: null,
+          releaseURL: null,
+        } : {}),
+      };
+      // Status changes historically accepted the root regardless of its release
+      // results. Synchronize unpublished children without rewriting published ones.
+      const targets = date === undefined
+        ? posts.filter((post) => post.id === root.id || (post.state !== State.PUBLISHED && !post.releaseId && !post.releaseURL))
+        : posts;
+      const result = await transaction.post.updateMany({
+        where: {
+          id: { in: targets.map((post) => post.id) },
+          organizationId: orgId,
+          integrationId: root.integrationId,
+          group: root.group,
+          deletedAt: null,
+          ...(date === undefined ? {
+            OR: [
+              { id: root.id },
+              { state: { not: State.PUBLISHED }, releaseId: null, releaseURL: null },
+            ],
+          } : {}),
+          ...(protectPublished ? { state: { not: State.PUBLISHED }, releaseId: null, releaseURL: null } : {}),
+        },
+        data,
+      });
+      if (result.count !== targets.length) {
+        throw new ConflictException('The post changed while its thread was being updated');
+      }
+      return transaction.post.findUniqueOrThrow({ where: { id, organizationId: orgId } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }
 
   countPostsFromDay(orgId: string, date: Date) {
@@ -602,6 +684,104 @@ export class PostsRepository {
     });
   }
 
+  async getDraftWorkflowPostIds(orgId: string, targets: Post[]) {
+    const batchIds = targets.map((post) => post.batchId).filter((batchId): batchId is string => !!batchId);
+    const posts = await this._post.model.post.findMany({
+      where: {
+        organizationId: orgId,
+        integrationId: { in: targets.map((post) => post.integrationId) },
+        OR: [
+          { id: { in: targets.map((post) => post.id) } },
+          { group: { in: targets.map((post) => post.group) } },
+          ...(batchIds.length ? [{ batchId: { in: batchIds } }] : []),
+        ],
+      },
+      select: { id: true },
+    });
+    return posts.map((post) => post.id);
+  }
+
+  async validatePostTargets(
+    orgId: string,
+    bodies: PostBody[],
+    database: Pick<Prisma.TransactionClient, 'post'> = this._post.model
+  ): Promise<Post[][]> {
+    const targets = await Promise.all(bodies.map(async (body) => {
+      const identifiers = body.value.map((value) => value.id).filter(Boolean);
+      if (!body.group && !identifiers.length) {
+        return [];
+      }
+      const matchedPosts = await database.post.findMany({
+        where: {
+          OR: [
+            ...(body.group ? [{ group: body.group, deletedAt: null }] : []),
+            ...(identifiers.length ? [{ id: { in: identifiers } }] : []),
+          ],
+        },
+      });
+      const identifiedPosts = matchedPosts.filter((post) => identifiers.includes(post.id));
+      if (
+        matchedPosts.some((post) => post.organizationId !== orgId || post.deletedAt) ||
+        identifiedPosts.some((post) => post.integrationId !== body.integration.id)
+      ) {
+        throw new BadRequestException('Post id or group is not owned by this integration');
+      }
+      // Editors assign temporary ids and a shared group to entirely new posts.
+      // A supplied id that exists anywhere, however, must pass ownership checks.
+      if (!matchedPosts.length) {
+        return [];
+      }
+      // Adding a channel to existing content reuses the editor's shared group.
+      // With no persisted ids on this channel it is a placeholder, never an
+      // instruction to modify the other channel's rows.
+      if (!identifiedPosts.length && matchedPosts.every((post) => post.integrationId !== body.integration.id)) {
+        return [];
+      }
+      const persistedIdentifiers = identifiers.filter((identifier) => matchedPosts.some((post) => post.id === identifier));
+      if (new Set(persistedIdentifiers).size !== persistedIdentifiers.length) {
+        throw new BadRequestException('An existing post cannot be saved more than once');
+      }
+      const targetGroup = identifiedPosts[0]?.group || body.group;
+      if ((body.group && targetGroup !== body.group) || identifiedPosts.some((post) => post.group !== targetGroup)) {
+        throw new BadRequestException('All post ids must belong to the same root');
+      }
+      const groupPosts = await database.post.findMany({
+        where: { organizationId: orgId, group: targetGroup, deletedAt: null },
+      });
+      const root = groupPosts.find((post) => !post.parentPostId);
+      if (!root) {
+        throw new BadRequestException('Post root or group not found');
+      }
+      if (groupPosts.some((post) => post.integrationId !== body.integration.id) || groupPosts.filter((post) => !post.parentPostId).length !== 1) {
+        throw new BadRequestException('Post group does not belong to this integration');
+      }
+      for (const post of groupPosts) {
+        const visited = new Set<string>();
+        let ancestor = post;
+        while (ancestor.parentPostId) {
+          if (visited.has(ancestor.id)) {
+            throw new BadRequestException('Invalid post comment chain');
+          }
+          visited.add(ancestor.id);
+          const parent = groupPosts.find((candidate) => candidate.id === ancestor.parentPostId);
+          if (!parent) {
+            throw new BadRequestException('Post comment does not belong to this root');
+          }
+          ancestor = parent;
+        }
+        if (ancestor.id !== root.id) {
+          throw new BadRequestException('Post comment does not belong to this root');
+        }
+      }
+      return groupPosts;
+    }));
+    const persistedIds = targets.flat().map((post) => post.id);
+    if (new Set(persistedIds).size !== persistedIds.length) {
+      throw new BadRequestException('An existing group cannot be saved more than once');
+    }
+    return targets;
+  }
+
   async createOrUpdatePost(
     state: 'draft' | 'schedule' | 'now' | 'update',
     orgId: string,
@@ -616,188 +796,123 @@ export class PostsRepository {
     keepGroup = false,
     // Shared by the posts saved together for several channels, so opening one
     // of them in the editor brings the others.
-    batchId?: string
+    batchId?: string,
+    saveAction: PostSaveAction = state,
+    republish = false
   ) {
-    const posts: Post[] = [];
-    const uuid = uuidv4();
-    const group = keepGroup && body.group ? body.group : uuid;
-
-    // an edited post stays in the batch it was created in, even when it is
-    // saved on its own or with a group that was rotated since
-    const ids = body.value.map((value) => value.id).filter(Boolean);
-    const existingBatchId =
-      body.group || ids.length
-        ? (
-            await this._post.model.post.findFirst({
-              where: {
-                organizationId: orgId,
-                deletedAt: null,
-                batchId: {
-                  not: null,
-                },
-                OR: [
-                  ...(body.group ? [{ group: body.group }] : []),
-                  ...(ids.length ? [{ id: { in: ids } }] : []),
-                ],
-              },
-              select: {
-                batchId: true,
-              },
-            })
-          )?.batchId
-        : undefined;
-
-    for (const value of body.value) {
-      const updateData = (type: 'create' | 'update') => ({
-        publishDate: dayjs(date).toDate(),
-        integration: {
-          connect: {
-            id: body.integration.id,
-            organizationId: orgId,
-          },
-        },
-        ...(posts?.[posts.length - 1]?.id
-          ? {
-              parentPost: {
-                connect: {
-                  id: posts[posts.length - 1]?.id,
-                },
-              },
-            }
-          : type === 'update'
-          ? {
-              parentPost: {
-                disconnect: true,
-              },
-            }
-          : {}),
-        content: value.content,
-        delay: value.delay || 0,
-        group,
-        batchId: existingBatchId || batchId,
-        intervalInDays: inter ? +inter : null,
-        approvedSubmitForOrder: APPROVED_SUBMIT_FOR_ORDER.NO,
-        ...(type === 'create' ? { creationMethod } : {}),
-        ...(state === 'update'
-          ? {}
-          : {
-              state:
-                state === 'draft' ? ('DRAFT' as const) : ('QUEUE' as const),
-            }),
-        image: JSON.stringify(value.image),
-        settings: JSON.stringify(body.settings),
-        organization: {
-          connect: {
-            id: orgId,
-          },
-        },
-      });
-
-      posts.push(
-        await this._post.model.post.upsert({
-          where: {
-            id: value.id || uuidv4(),
-          },
-          create: { ...updateData('create') },
-          update: {
-            ...updateData('update'),
-            lastMessage: {
-              disconnect: true,
-            },
-            submittedForOrder: {
-              disconnect: true,
-            },
-          },
-        })
-      );
-
-      if (posts.length === 1) {
-        await this._tagsPosts.model.tagsPosts.deleteMany({
-          where: {
-            post: {
-              id: posts[0].id,
-            },
-          },
+    try {
+      return await this._transaction.model.$transaction(async (transaction) => {
+        const integration = await transaction.integration.findFirst({
+          where: { id: body.integration.id, organizationId: orgId, deletedAt: null },
+          select: { id: true },
         });
-
-        if (tags.length) {
-          const tagsList = await this._tags.model.tags.findMany({
-            where: {
-              orgId: orgId,
-              deletedAt: null,
-              name: {
-                in: tags.map((tag) => tag.label).filter((f) => f),
-              },
-            },
-          });
-
-          if (tagsList.length) {
-            await this._post.model.post.update({
-              where: {
-                id: posts[posts.length - 1].id,
-              },
-              data: {
-                tags: {
-                  createMany: {
-                    data: tagsList.map((tag) => ({
-                      tagId: tag.id,
-                    })),
-                  },
-                },
-              },
-            });
-          }
+        if (!integration) {
+          throw new BadRequestException('Integration not found');
         }
-      }
-    }
+        const [existingPosts] = await this.validatePostTargets(orgId, [body], transaction);
+        const existingRoot = existingPosts.find((post) => !post.parentPostId);
+        const protectPublished = saveAction === 'pass' || ((state === 'schedule' || state === 'now') && !republish);
+        if (protectPublished && existingPosts.some((post) => post.state === 'PUBLISHED')) {
+          throw new ConflictException('This post was published while it was being saved');
+        }
+        if (saveAction === 'pass' && existingPosts.some((post) => post.state !== 'DRAFT' || post.releaseId || post.releaseURL || post.error)) {
+          throw new ConflictException('Only untouched drafts can be passed safely');
+        }
+        if (state === 'update' && !existingRoot) {
+          throw new BadRequestException('An update requires an existing post');
+        }
 
-    const previousPost = body.group
-      ? (
-          await this._post.model.post.findFirst({
+        const posts: Post[] = [];
+        const group = keepGroup && body.group ? body.group : uuidv4();
+        const existingBatchId = existingPosts.find((post) => post.batchId)?.batchId;
+        for (const value of body.value) {
+          const previousComment = posts[posts.length - 1];
+          const existingPost = existingPosts.find((post) => post.id === value.id);
+          const data = {
+            publishDate: dayjs(date).toDate(),
+            integration: { connect: { id: integration.id, organizationId: orgId } },
+            ...(previousComment
+              ? { parentPost: { connect: { id: previousComment.id } } }
+              : {}),
+            content: value.content,
+            delay: value.delay || 0,
+            group,
+            batchId: existingBatchId || batchId,
+            intervalInDays: inter ? +inter : null,
+            approvedSubmitForOrder: APPROVED_SUBMIT_FOR_ORDER.NO,
+            saveAction,
+            // New comments inherit the root state on a content-only update.
+            ...(state === 'update'
+              ? existingPost ? {} : { state: existingRoot!.state }
+              : { state: state === 'draft' ? State.DRAFT : State.QUEUE }),
+            image: JSON.stringify(value.image),
+            settings: JSON.stringify(body.settings),
+            organization: { connect: { id: orgId } },
+          };
+          posts.push(existingPost
+            ? await transaction.post.update({
+                where: {
+                  id: value.id,
+                  organizationId: orgId,
+                  integrationId: integration.id,
+                  deletedAt: null,
+                  ...(saveAction === 'pass'
+                    ? { state: State.DRAFT, releaseId: null, releaseURL: null, error: null }
+                    : protectPublished ? { state: { not: State.PUBLISHED } } : {}),
+                },
+                data: {
+                  ...data,
+                  ...(!previousComment ? { parentPost: { disconnect: true } } : {}),
+                  lastMessage: { disconnect: true },
+                  submittedForOrder: { disconnect: true },
+                },
+              })
+            : await transaction.post.create({ data: { ...data, id: uuidv4(), creationMethod } }));
+        }
+
+        await transaction.tagsPosts.deleteMany({ where: { postId: posts[0].id } });
+        const tagsList = tags.length ? await transaction.tags.findMany({
+          where: {
+            orgId,
+            deletedAt: null,
+            name: { in: tags.map((tag) => tag.label).filter(Boolean) },
+          },
+          select: { id: true },
+        }) : [];
+        if (tagsList.length) {
+          await transaction.post.update({
+            where: { id: posts[0].id, organizationId: orgId },
+            data: { tags: { createMany: { data: tagsList.map((tag) => ({ tagId: tag.id })) } } },
+          });
+        }
+
+        if (body.group) {
+          const removedPosts = existingPosts.filter((post) => !posts.some((savedPost) => savedPost.id === post.id));
+          const removed = await transaction.post.updateMany({
             where: {
+              id: { in: removedPosts.map((post) => post.id) },
+              organizationId: orgId,
+              integrationId: integration.id,
               group: body.group,
               deletedAt: null,
-              parentPostId: null,
+              ...(saveAction === 'pass'
+                ? { state: State.DRAFT, releaseId: null, releaseURL: null, error: null }
+                : protectPublished ? { state: { not: State.PUBLISHED } } : {}),
             },
-            select: {
-              id: true,
-            },
-          })
-        )?.id!
-      : undefined;
-
-    if (body.group && !keepGroup) {
-      await this._post.model.post.updateMany({
-        where: {
-          group: body.group,
-          deletedAt: null,
-        },
-        data: {
-          parentPostId: null,
-          deletedAt: new Date(),
-        },
-      });
+            data: { parentPostId: null, deletedAt: new Date() },
+          });
+          if (removed.count !== removedPosts.length) {
+            throw new ConflictException('The post changed while it was being saved');
+          }
+        }
+        return { previousPost: existingRoot?.id, posts };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && ['P2025', 'P2034'].includes(error.code)) {
+        throw new ConflictException('The post changed while it was being saved. Reload before retrying.');
+      }
+      throw error;
     }
-
-    // keepGroup: the updated rows still carry the old group, so sweep only the
-    // rows dropped from it (removed comments) by id instead of by group.
-    if (body.group && keepGroup) {
-      await this._post.model.post.updateMany({
-        where: {
-          group: body.group,
-          deletedAt: null,
-          id: {
-            notIn: posts.map((p) => p.id),
-          },
-        },
-        data: {
-          parentPostId: null,
-          deletedAt: new Date(),
-        },
-      });
-    }
-
-    return { previousPost, posts };
   }
 
   async submit(id: string, order: string, buyerOrganizationId: string) {

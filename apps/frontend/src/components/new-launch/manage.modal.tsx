@@ -67,10 +67,14 @@ import dayjs from 'dayjs';
 import { Button } from '@gitroom/react/form/button';
 import { useClickOutside } from '@mantine/hooks';
 
+type SaveType = 'draft' | 'now' | 'schedule' | 'update';
+type SaveAction = SaveType | 'pass';
+
 export const ManageModal: FC<AddEditModalProps> = (props) => {
   const t = useT();
   const fetch = useFetch();
   const ref = useRef(null);
+  const submittingRef = useRef(false);
   const existingData = useExistingData();
   const [loading, setLoading] = useState(false);
   const toaster = useToaster();
@@ -136,17 +140,60 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
 
       setDate(newDate);
     },
-    [channelDate, current]
+    [channelDate, current, setChannelDate, setDate]
   );
 
   // the date sheet applies its changes only on save
   const [dateDraft, setDateDraft] = useState(date);
 
   // the channels the post already has, each with its own post
-  const existingPosts = [existingData, ...(existingData.siblings || [])];
+  const existingPosts = useMemo(
+    () => [existingData, ...(existingData.siblings || [])],
+    [existingData]
+  );
   // the channel in view, or the one that was opened
   const channel =
     existingPosts.find((p) => p.integration === current) || existingData;
+  const eligibleRejectChannels = useMemo(
+    () =>
+      selectedIntegrations.filter(({ integration }) => {
+        const existingChannel = existingPosts.find(
+          (existingPost) => existingPost.integration === integration.id
+        );
+        if (!existingChannel) {
+          return true;
+        }
+        // Only untouched drafts are eligible; the server also checks workflow history.
+        return (
+          existingChannel.posts.length > 0 &&
+          existingChannel.posts.every(
+            (post) =>
+              post.state === 'DRAFT' &&
+              !post.releaseId &&
+              !post.releaseURL &&
+              !post.error
+          )
+        );
+      }),
+    [existingPosts, selectedIntegrations]
+  );
+  const canReject =
+    !dummy &&
+    !addEditSets &&
+    (current === 'global'
+      ? eligibleRejectChannels.length > 0
+      : eligibleRejectChannels.some(
+          ({ integration }) => integration.id === current
+        ));
+  const currentPost = channel.posts?.[0] as
+    | ((typeof channel.posts)[number] & { saveAction?: string | null })
+    | undefined;
+  const isRejected =
+    currentPost?.state === 'DRAFT' && currentPost.saveAction === 'pass';
+  const scheduleAction: SaveAction =
+    !dummy && currentPost && currentPost.state !== 'DRAFT'
+      ? 'update'
+      : 'schedule';
 
   useEffect(() => {
     if (hide) {
@@ -226,6 +273,9 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
   }, [activateExitButton, dummy]);
 
   const deletePost = useCallback(async () => {
+    if (submittingRef.current || loading || locked) {
+      return;
+    }
     setLoading(true);
     if (existingData.siblings?.length) {
       const groups = await new Promise<string[]>((resolve) => {
@@ -312,14 +362,121 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
     mutate();
     modal.closeAll();
     return;
-  }, [existingData, mutate, modal, current, integrations]);
+  }, [
+    existingData,
+    existingPosts,
+    channel,
+    mutate,
+    modal,
+    integrations,
+    fetch,
+    t,
+    loading,
+    locked,
+  ]);
 
-  const schedule = useCallback(
-    (type: 'draft' | 'now' | 'schedule' | 'update') => async () => {
+  const submit = useCallback(
+    async (type: SaveType, action: SaveAction) => {
       let republish = false;
+      let rejectChannelIds: string[] | undefined;
+      if (action === 'pass') {
+        if (!canReject) {
+          return;
+        }
+        const eligibleIds = eligibleRejectChannels.map(
+          ({ integration }) => integration.id
+        );
+        rejectChannelIds = current === 'global' ? eligibleIds : [current];
+        if (current === 'global') {
+          const confirmed = await deleteDialog(
+            t(
+              'reject_selected_unpublished_channels_question',
+              'Reject all selected new posts and eligible drafts? Scheduled, failed, published, ineligible draft and unselected channels will not be changed.'
+            ),
+            t(
+              'reject_all_unpublished_channels',
+              'Reject all new posts and eligible drafts'
+            )
+          );
+          if (!confirmed) {
+            return;
+          }
+        } else if (selectedIntegrations.length > 1) {
+          const choice = await new Promise<'all' | 'only' | undefined>(
+            (resolve) => {
+              modal.openModal({
+                id: 'reject-post-channels',
+                title: t('reject_post', 'Reject'),
+                onClose: () => resolve(undefined),
+                children: (
+                  <div className="flex flex-col gap-[20px]">
+                    <div className="text-[20px]">
+                      {t(
+                        'reject_post_in_all_channels_question',
+                        'Reject only the current channel or all selected new posts and eligible drafts? Scheduled, failed, published, ineligible draft and unselected channels will not be changed.'
+                      )}
+                    </div>
+                    <div className="flex w-full gap-[10px] mobile:flex-col">
+                      <Button
+                        type="button"
+                        className="flex-1"
+                        onClick={() => {
+                          resolve('all');
+                          modal.closeById('reject-post-channels');
+                        }}
+                      >
+                        {t(
+                          'reject_all_unpublished_channels',
+                          'Reject all new posts and eligible drafts'
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        secondary
+                        className="flex-1"
+                        onClick={() => {
+                          resolve('only');
+                          modal.closeById('reject-post-channels');
+                        }}
+                      >
+                        {t('only_channel', 'Only')}{' '}
+                        {
+                          integrations.find(
+                            (integration) => integration.id === current
+                          )?.name
+                        }
+                      </Button>
+                    </div>
+                  </div>
+                ),
+              });
+            }
+          );
+          if (!choice) {
+            return;
+          }
+          rejectChannelIds = choice === 'all' ? eligibleIds : [current];
+        }
+      }
       // the channels saved as another type, the rest are saved as `type`
       const saveAs: Record<string, 'draft' | 'schedule' | 'update'> = {};
       const saveTypeOf = (id: string) => saveAs[id] || type;
+      const saveActionOf = (integrationId: string): SaveAction => {
+        if (action === 'pass') {
+          return 'pass';
+        }
+        if (saveAs[integrationId]) {
+          return saveAs[integrationId];
+        }
+        const existingPost = existingPosts.find(
+          (post) => post.integration === integrationId
+        )?.posts?.[0];
+        return action === 'update' && type === 'schedule'
+          ? existingPost && existingPost.state !== 'DRAFT'
+            ? 'update'
+            : 'schedule'
+          : action;
+      };
       // the channels that already went out, or are going out right now
       const published = existingPosts.filter(
         (p) =>
@@ -343,7 +500,7 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
       }
 
       // a draft of a post with other channels leaves the published ones as they are
-      if (type === 'draft' && existingData.siblings?.length) {
+      if (action !== 'pass' && type === 'draft' && existingData.siblings?.length) {
         for (const p of published) {
           if (p.posts[0].state === 'PUBLISHED') {
             saveAs[p.integration] = 'update';
@@ -363,6 +520,7 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
       // (scheduling their drafts, moving them to drafts) can do it only for
       // the channel in view, the others keep their state
       if (
+        action !== 'pass' &&
         type !== 'update' &&
         others.some(
           (p) =>
@@ -549,7 +707,18 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
       // Pull the local values to build the payload, but rely on the server
       // (`/posts/valid`) for the actual validation — checkValidity now lives
       // server-side so it can't be bypassed.
-      const allValues = await ref.current.getAllValues();
+      const editorValues = await ref.current.getAllValues();
+      // Rejection must not resave the channels outside the chosen scope.
+      const allValues = editorValues.filter(
+        (post: any) => !rejectChannelIds || rejectChannelIds.includes(post.id)
+      );
+      if (!allValues.length) {
+        toaster.show(
+          t('no_posts_to_save', 'There are no eligible posts to save'),
+          'warning'
+        );
+        return;
+      }
 
       const integrationById = (id: string) =>
         selectedIntegrations.find((p) => p.integration.id === id);
@@ -717,6 +886,7 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
 
       const data = {
         type,
+        saveAction: action,
         ...(republish ? { republish } : {}),
         ...(repeater ? { inter: repeater } : {}),
         tags,
@@ -745,16 +915,38 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
         if (addEditSets) {
           addEditSets(data);
         } else {
-          // every type of save is its own request, the drafts last, since a
-          // draft save skips the checks the others still run
+          // Keep actions separate even when their publishing type matches.
+          // Drafts stay last because they skip the publishing checks.
           let saved = false;
-          for (const requestType of ['update', 'schedule', 'now', 'draft']) {
-            const request = {
-              type: requestType,
-              posts: posts.filter(
-                (p: any) => saveTypeOf(p.integration.id) === requestType
-              ),
-            };
+          const requests: {
+            type: SaveType;
+            saveAction: SaveAction;
+            posts: typeof posts;
+          }[] = [];
+          for (const requestType of [
+            'update',
+            'schedule',
+            'now',
+            'draft',
+          ] as const) {
+            for (const post of posts) {
+              if (saveTypeOf(post.integration.id) !== requestType) {
+                continue;
+              }
+              const saveAction = saveActionOf(post.integration.id);
+              const request = requests.find(
+                (candidate) =>
+                  candidate.type === requestType &&
+                  candidate.saveAction === saveAction
+              );
+              if (request) {
+                request.posts.push(post);
+              } else {
+                requests.push({ type: requestType, saveAction, posts: [post] });
+              }
+            }
+          }
+          for (const request of requests) {
             if (!request.posts.length) {
               continue;
             }
@@ -782,6 +974,13 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
               return;
             }
             saved = true;
+          }
+          if (!saved) {
+            toaster.show(
+              t('no_posts_to_save', 'There are no eligible posts to save'),
+              'warning'
+            );
+            return;
           }
         }
 
@@ -816,14 +1015,56 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
       addEditSets,
       dummy,
       shortlinkPreferenceData,
+      canReject,
+      eligibleRejectChannels,
+      existingData,
+      existingPosts,
+      channel,
+      customClose,
+      fetch,
+      modal,
+      mutate,
+      t,
+      toaster,
     ]
+  );
+
+  const schedule = useCallback(
+    (type: SaveType, action: SaveAction = type) => async () => {
+      if (
+        submittingRef.current ||
+        loading ||
+        locked ||
+        !selectedIntegrations.length
+      ) {
+        return;
+      }
+      submittingRef.current = true;
+      setLoading(true);
+      setShowPostNow(false);
+      try {
+        await submit(type, action);
+      } catch (error) {
+        toaster.show(
+          error instanceof Error
+            ? error.message
+            : t('post_save_failed', 'Could not save the post'),
+          'warning'
+        );
+        mutate();
+      } finally {
+        submittingRef.current = false;
+        setLoading(false);
+      }
+    },
+    [loading, locked, selectedIntegrations.length, submit, toaster, t, mutate]
   );
 
   const scheduleLabel = dummy
     ? t('create_output', 'Create output')
     : !existingData?.integration
     ? t('add_to_calendar', 'Add to calendar')
-    : existingData?.posts?.[0]?.state === 'DRAFT'
+    : currentPost?.state === 'DRAFT'
     ? t('schedule', 'Schedule')
     : t('update', 'Update');
 
@@ -839,7 +1080,7 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
         {
           label: scheduleLabel,
           variant: 'primary',
-          onClick: schedule('schedule'),
+          onClick: schedule('schedule', scheduleAction),
         },
         ...(!dummy
           ? [
@@ -847,6 +1088,15 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
                 label: t('post_now', 'Post Now'),
                 variant: 'secondary' as const,
                 onClick: schedule('now'),
+              },
+            ]
+          : []),
+        ...(canReject
+          ? [
+              {
+                label: t('reject_post', 'Reject'),
+                variant: 'tertiary' as const,
+                onClick: schedule('draft', 'pass'),
               },
             ]
           : []),
@@ -972,6 +1222,11 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
                       </>
                     )}
                   </div>
+                  {isRejected && (
+                    <div className="self-start rounded-full border border-newTableBorder bg-btnSimple px-[10px] py-[4px] text-[12px] font-[600] text-btnText">
+                      {t('rejected', 'Rejected')}
+                    </div>
+                  )}
                   <div className="flex flex-1 gap-[6px] mobile:gap-[16px] flex-col">
                     <div className="flex mobile:items-center mobile:gap-[4px]">
                       <div className="flex-1 mobile:flex-initial mobile:min-w-0">
@@ -1124,7 +1379,8 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
             {existingData?.integration && (
               <button
                 onClick={deletePost}
-                className="cursor-pointer flex text-[#FF3F3F] gap-[8px] items-center text-[15px] font-[600]"
+                disabled={loading || locked}
+                className="cursor-pointer flex text-[#FF3F3F] gap-[8px] items-center text-[15px] font-[600] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <div>
                   <TrashIcon />
@@ -1168,7 +1424,7 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
                   disabled={
                     selectedIntegrations.length === 0 || loading || locked
                   }
-                  onClick={schedule('schedule')}
+                  onClick={schedule('schedule', scheduleAction)}
                   className="text-white relative min-w-[180px] btnSub disabled:cursor-not-allowed disabled:opacity-80 outline-none gap-[8px] flex justify-center items-center h-[44px] rounded-[8px] bg-[#612BD3] ps-[20px] pe-[16px]"
                 >
                   {loading && (
@@ -1205,20 +1461,33 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
                 </button>
 
                 {!dummy && (
-                  <button
-                    onClick={schedule('now')}
-                    disabled={
-                      selectedIntegrations.length === 0 || loading || locked
-                    }
+                  <div
                     className={clsx(
-                      'rounded-[8px] z-[300] disabled:cursor-not-allowed disabled:opacity-80 absolute bottom-[100%] -left-[12px] p-[12px] w-[206px] bg-newBgColorInner',
+                      'rounded-[8px] z-[300] absolute bottom-[100%] -left-[12px] p-[12px] w-[206px] bg-newBgColorInner flex-col gap-[8px]',
                       showPostNow ? 'flex' : 'hidden group-hover:flex'
                     )}
                   >
-                    <div className="text-white rounded-[8px] bg-[#D82D7E] h-[44px] w-full flex justify-center items-center post-now">
+                    <button
+                      type="button"
+                      onClick={schedule('now')}
+                      disabled={
+                        selectedIntegrations.length === 0 || loading || locked
+                      }
+                      className="text-white rounded-[8px] bg-ai h-[44px] w-full flex justify-center items-center post-now disabled:cursor-not-allowed disabled:opacity-80"
+                    >
                       {t('post_now', 'Post Now')}
-                    </div>
-                  </button>
+                    </button>
+                    {canReject && (
+                      <button
+                        type="button"
+                        onClick={schedule('draft', 'pass')}
+                        disabled={loading || locked}
+                        className="rounded-[8px] bg-btnSimple text-btnText h-[44px] w-full flex justify-center items-center disabled:cursor-not-allowed disabled:opacity-80"
+                      >
+                        {t('reject_post', 'Reject')}
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             )}
@@ -1280,15 +1549,17 @@ export const ManageModal: FC<AddEditModalProps> = (props) => {
               onClick={() => setMobileSheet('repeat')}
             />
             {existingData?.integration && (
-              <div
+              <button
+                type="button"
                 onClick={deletePost}
-                className="flex items-center gap-[12px] py-[8px] cursor-pointer text-[#FF3F3F]"
+                disabled={loading || locked}
+                className="flex items-center gap-[12px] py-[8px] cursor-pointer text-[#FF3F3F] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <TrashIcon size={24} />
                 <div className="text-[15px] font-[600]">
                   {t('delete_post', 'Delete Post')}
                 </div>
-              </div>
+              </button>
             )}
           </div>
         </BottomSheet>

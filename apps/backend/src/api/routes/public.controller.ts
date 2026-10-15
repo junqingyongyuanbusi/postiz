@@ -57,7 +57,7 @@ export class PublicController {
     // the batch only links the posts in the dashboard, it stays out of the
     // public preview
     return (await this._postsService.getPostsRecursively(id, true)).map(
-      ({ childrenPost, batchId, ...p }) => ({
+      ({ childrenPost, batchId, saveAction, ...p }) => ({
         ...p,
         ...(p.integration
           ? {

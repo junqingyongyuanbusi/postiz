@@ -146,10 +146,8 @@ export class PublicIntegrationsController {
           ? rawBody.posts.map((post: any) => omit(post, 'date'))
           : rawBody?.posts,
       },
-      org.id,
-      rawBody?.type === 'draft' || true
+      org.id
     );
-    body.type = rawBody.type;
 
     if (
       process.env.RESTRICT_UPLOAD_DOMAINS &&
@@ -629,7 +627,7 @@ export class PublicIntegrationsController {
   ) {
     Sentry.metrics.count('public_api-request', 1);
     // the batch only links the posts in the dashboard
-    const { batchId, ...post } = await this._postsService.updateReleaseId(
+    const { batchId, saveAction, ...post } = await this._postsService.updateReleaseId(
       org.id,
       id,
       releaseId

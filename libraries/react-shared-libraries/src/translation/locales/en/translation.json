@@ -1,5 +1,11 @@
 {
   "calendar": "Calendar",
+  "reject_post": "Reject",
+  "rejected": "Rejected",
+  "reject_post_in_all_channels_question": "Reject only the current channel or all selected new posts and eligible drafts? Scheduled, failed, published, ineligible draft and unselected channels will not be changed.",
+  "reject_selected_unpublished_channels_question": "Reject all selected new posts and eligible drafts? Scheduled, failed, published, ineligible draft and unselected channels will not be changed.",
+  "reject_all_unpublished_channels": "Reject all new posts and eligible drafts",
+  "no_posts_to_save": "There are no eligible posts to save",
   "webhooks": "Webhooks",
   "webhooks_are_a_way_to_get_notified_when_something_happens_in_postiz_via_an_http_request": "Webhooks are a way to get notified when something happens in Postiz via\n an HTTP request.",
   "name": "Name",

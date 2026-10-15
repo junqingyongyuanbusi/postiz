@@ -55,6 +55,7 @@ function slimPost(post: any) {
     payoutProblems,
     comments,
     errors,
+    saveAction,
     ...rest
   } = post;
   return rest;
@@ -166,7 +167,25 @@ export class PostActivity {
       return false;
     }
 
-    return reanchorInterval(post);
+    const { saveAction, submittedForOrder, ...workflowPost } =
+      post as typeof post & {
+        saveAction?: string | null;
+      };
+    return reanchorInterval({
+      ...workflowPost,
+      submittedForOrder: submittedForOrder
+        ? {
+            ...submittedForOrder,
+            posts: submittedForOrder.posts.map((orderPost) => {
+              const { saveAction, ...workflowOrderPost } =
+                orderPost as typeof orderPost & {
+                  saveAction?: string | null;
+                };
+              return workflowOrderPost;
+            }),
+          }
+        : submittedForOrder,
+    });
   }
 
   @ActivityMethod()
@@ -226,30 +245,33 @@ export class PostActivity {
           posts
         );
 
+        const mappedPosts = await Promise.all(
+          (newPosts || []).map(async (p) => ({
+            id: p.id,
+            message: stripHtmlValidation(
+              getIntegration.editor,
+              p.content,
+              true,
+              false,
+              !/<\/?[a-z][\s\S]*>/i.test(p.content),
+              getIntegration.mentionFormat
+            ),
+            settings: JSON.parse(p.settings || '{}'),
+            media: await this._postService.updateMedia(
+              p.id,
+              JSON.parse(p.image || '[]'),
+              getIntegration?.convertToJPEG || false
+            ),
+          }))
+        );
+
+        await this.assertPostsPublishable(integration, posts);
         return getIntegration.comment(
           integration.internalId,
           postId,
           lastPostId,
           integration.token,
-          await Promise.all(
-            (newPosts || []).map(async (p) => ({
-              id: p.id,
-              message: stripHtmlValidation(
-                getIntegration.editor,
-                p.content,
-                true,
-                false,
-                !/<\/?[a-z][\s\S]*>/i.test(p.content),
-                getIntegration.mentionFormat
-              ),
-              settings: JSON.parse(p.settings || '{}'),
-              media: await this._postService.updateMedia(
-                p.id,
-                JSON.parse(p.image || '[]'),
-                getIntegration?.convertToJPEG || false
-              ),
-            }))
-          ),
+          mappedPosts,
           integration
         );
       })
@@ -321,6 +343,29 @@ export class PostActivity {
     );
   }
 
+  private async assertPostsPublishable(integration: Integration, posts: Post[]) {
+    // Re-read the original IDs after media/tag preparation, not the workflow snapshot.
+    for (const post of posts) {
+      const storedPost = await this._postService.getPostById(
+        post.id,
+        integration.organizationId
+      );
+      if (
+        !storedPost ||
+        storedPost.deletedAt ||
+        storedPost.state === State.DRAFT ||
+        ('saveAction' in storedPost && storedPost.saveAction === 'pass')
+      ) {
+        throw new BadBody(
+          integration.providerIdentifier,
+          JSON.stringify({}),
+          Buffer.from('{}'),
+          'Post is no longer eligible for publishing.'
+        );
+      }
+    }
+  }
+
   private async postSocialBody(
     integration: Integration,
     posts: Post[],
@@ -373,6 +418,7 @@ export class PostActivity {
       }))
     );
 
+    await this.assertPostsPublishable(integration, posts);
     setHeartbeatDetails(`${integration.providerIdentifier}: publish`);
     const postNow =
       allowPending && getIntegration.postPending

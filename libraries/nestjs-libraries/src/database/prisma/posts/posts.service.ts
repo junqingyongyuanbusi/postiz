@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
   ValidationPipe,
@@ -15,6 +16,7 @@ import {
   From,
   CreationMethod,
   State,
+  PostSaveAction,
 } from '@prisma/client';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
 import { GetPostsListDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.list.dto';
@@ -40,6 +42,7 @@ dayjs.extend(utc);
 import * as Sentry from '@sentry/nestjs';
 import { TemporalService } from 'nestjs-temporal-core';
 import { TypedSearchAttributes } from '@temporalio/common';
+import { WorkflowNotFoundError } from '@temporalio/client';
 import {
   organizationId,
   postId as postIdSearchParam,
@@ -391,18 +394,43 @@ export class PostsService {
     };
   }
 
+  getSaveAction(body: Pick<CreatePostDto, 'type' | 'saveAction'>): PostSaveAction {
+    const allowedTypes = ['draft', 'schedule', 'now', 'update'];
+    if (!allowedTypes.includes(body?.type)) {
+      throw new BadRequestException('Invalid post type');
+    }
+
+    const saveAction =
+      body.saveAction === undefined ? body.type : body.saveAction;
+    const validCombination =
+      saveAction === 'pass'
+        ? body.type === 'draft'
+        : saveAction === 'update'
+        ? body.type === 'schedule' || body.type === 'update'
+        : saveAction === body.type;
+    if (!Object.values(PostSaveAction).includes(saveAction) || !validCombination) {
+      throw new BadRequestException('Invalid saveAction for this post type');
+    }
+    return saveAction;
+  }
+
   async mapTypeToPost(
     body: CreatePostDto,
     organization: string,
-    replaceDraft: boolean = false
+    replaceDraft = false
   ): Promise<CreatePostDto> {
-    if (!body?.posts?.every((p) => p?.integration?.id)) {
+    this.getSaveAction(body);
+    if (
+      !Array.isArray(body?.posts) ||
+      !body.posts.length ||
+      !body.posts.every((post) => post?.integration?.id)
+    ) {
       throw new BadRequestException('All posts must have an integration id');
     }
 
     const mappedValues = {
       ...body,
-      type: replaceDraft ? 'schedule' : body?.type,
+      type: replaceDraft ? 'schedule' : body.type,
       posts: await Promise.all(
         body?.posts?.map(async (post) => {
           const integration = await this._integrationService.getIntegrationById(
@@ -417,8 +445,8 @@ export class PostsService {
           }
 
           return {
-            type: replaceDraft ? 'schedule' : body?.type,
             ...post,
+            type: replaceDraft ? 'schedule' : body.type,
             settings: {
               ...(post.settings || ({} as any)),
               __type: integration.providerIdentifier,
@@ -893,6 +921,10 @@ export class PostsService {
     orgId: string,
     state: State
   ) {
+    const currentPost = await this._postRepository.getPostById(postId, orgId);
+    if (!currentPost || currentPost.deletedAt || currentPost.saveAction === 'pass') {
+      return;
+    }
     try {
       const workflows = this._temporalService.client
         .getRawClient()
@@ -920,6 +952,11 @@ export class PostsService {
     }
 
     try {
+      // A detached save may resume after a later save passed this draft.
+      const latestPost = await this._postRepository.getPostById(postId, orgId);
+      if (!latestPost || latestPost.deletedAt || latestPost.state !== 'QUEUE' || latestPost.saveAction === 'pass') {
+        return;
+      }
       await this._temporalService.client
         .getRawClient()
         ?.workflow.start('postWorkflowV112', {
@@ -945,6 +982,42 @@ export class PostsService {
           ]),
         });
     } catch (err) {}
+  }
+
+  private async confirmDraftWorkflowsStopped(orgId: string, targets: Post[]) {
+    try {
+      const client = this._temporalService.client.getRawClient();
+      if (!client) {
+        throw new Error('Temporal unavailable');
+      }
+      const workflowPostIds = await this._postRepository.getDraftWorkflowPostIds(orgId, targets);
+      for (const workflowPostId of workflowPostIds) {
+        // Visibility includes recurring ABANDON children. Any history at all
+        // is deliberately ambiguous here; this path is only for untouched
+        // drafts, not cancellation of a previously scheduled publication.
+        for await (const execution of client.workflow.list({
+          query: `postId=${JSON.stringify(workflowPostId)}`,
+        })) {
+          throw new ConflictException(
+            `This draft has publishing workflow history (${execution.workflowId}). Safe cancellation requires a publishing protocol.`
+          );
+        }
+        // Visibility is eventually consistent: also inspect the canonical id.
+        try {
+          await client.workflow.getHandle(`post_${workflowPostId}`).describe();
+          throw new ConflictException('This draft has a publishing workflow and cannot safely be passed.');
+        } catch (error) {
+          if (!(error instanceof WorkflowNotFoundError)) {
+            throw error;
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof ConflictException) {
+        throw error;
+      }
+      throw new ConflictException('Could not confirm publishing workflows are absent. No content was saved.');
+    }
   }
 
   /**
@@ -1104,19 +1177,48 @@ export class PostsService {
     creationMethod: CreationMethod,
     keepGroup = false
   ): Promise<any[]> {
+    const saveAction = this.getSaveAction(body);
+    const effectiveType = body.type;
+    if (!Array.isArray(body.posts) || !body.posts.length) {
+      throw new BadRequestException('At least one post is required');
+    }
+    for (const post of body.posts) {
+      if (!post?.integration?.id || !Array.isArray(post.value) || !post.value.length) {
+        throw new BadRequestException('All posts must have an integration and content');
+      }
+      if (post.value.some((value) => !value || (value.id !== undefined && typeof value.id !== 'string'))) {
+        throw new BadRequestException('Invalid post id');
+      }
+      if (post.group !== undefined && (typeof post.group !== 'string' || !post.group)) {
+        throw new BadRequestException('Invalid post group');
+      }
+      if (!await this._integrationService.getIntegrationById(orgId, post.integration.id)) {
+        throw new BadRequestException('Integration not found');
+      }
+    }
+    const existingTargets = await this._postRepository.validatePostTargets(orgId, body.posts);
+    if (saveAction === 'pass') {
+      // A queued workflow can dispatch a mutation between history inspection
+      // and cancellation. Supporting it requires a workflow-side handshake.
+      if (existingTargets.flat().some((post) => post.state !== 'DRAFT' || post.releaseId || post.releaseURL || post.error)) {
+        throw new ConflictException('Only untouched drafts can be passed safely. Scheduled or uncertain posts require a publishing cancellation protocol.');
+      }
+      for (const targets of existingTargets) {
+        if (targets.length) {
+          await this.confirmDraftWorkflowsStopped(orgId, targets);
+        }
+      }
+    }
+    if ((effectiveType === 'schedule' || effectiveType === 'now') && !body.republish) {
+      for (const posts of existingTargets) {
+        for (const post of posts) {
+          this.guardAgainstRepublish(post, 'createPost');
+        }
+      }
+    }
     const postList = [];
     const batchId = uuidv4();
     for (const post of body.posts) {
-      if (
-        (body.type === 'schedule' || body.type === 'now') &&
-        !body.republish &&
-        post.value?.[0]?.id
-      ) {
-        this.guardAgainstRepublish(
-          await this._postRepository.getPostById(post.value[0].id, orgId),
-          'createPost'
-        );
-      }
       const provider = this._integrationManager.getSocialIntegration(
         (post.settings as any)?.__type
       );
@@ -1138,9 +1240,9 @@ export class PostsService {
       }));
 
       const { posts } = await this._postRepository.createOrUpdatePost(
-        body.type,
+        effectiveType,
         orgId,
-        body.type === 'now'
+        effectiveType === 'now'
           ? dayjs().format('YYYY-MM-DDTHH:mm:00')
           : post.date || body.date,
         post,
@@ -1148,7 +1250,9 @@ export class PostsService {
         creationMethod,
         body.inter,
         keepGroup,
-        batchId
+        batchId,
+        saveAction,
+        body.republish === true
       );
 
       if (!posts?.length) {
@@ -1160,7 +1264,7 @@ export class PostsService {
         posts.filter((p) => existingIds.includes(p.id))
       );
 
-      if (body.type !== 'update') {
+      if (effectiveType !== 'update' && saveAction !== 'pass') {
         this.startWorkflow(
           post.settings.__type.split('-')[0].toLowerCase(),
           posts[0].id,
@@ -1339,13 +1443,15 @@ export class PostsService {
     id: string,
     status: 'draft' | 'schedule'
   ) {
+    if (status !== 'draft' && status !== 'schedule') {
+      throw new BadRequestException('Invalid post status');
+    }
     const getPostById = await this._postRepository.getPostById(id, orgId);
     if (!getPostById) {
       throw new BadRequestException('Post not found');
     }
 
-    const state: State = status === 'draft' ? 'DRAFT' : 'QUEUE';
-    await this._postRepository.changeState(id, state);
+    const { state } = await this._postRepository.changePostStatus(orgId, id, status);
 
     try {
       await this.startWorkflow(
@@ -1368,6 +1474,13 @@ export class PostsService {
   ) {
     const getPostById = await this._postRepository.getPostById(id, orgId);
 
+    if (!getPostById || getPostById.deletedAt) {
+      throw new BadRequestException('Post not found');
+    }
+    if (action !== 'schedule' && action !== 'update') {
+      throw new BadRequestException('Invalid post date action');
+    }
+
     if (action === 'schedule' && !republish) {
       this.guardAgainstRepublish(getPostById, 'changeDate');
     }
@@ -1379,7 +1492,8 @@ export class PostsService {
       id,
       date,
       getPostById.state === 'DRAFT',
-      action
+      action,
+      republish
     );
 
     if (action === 'schedule') {
@@ -1390,7 +1504,7 @@ export class PostsService {
             .toLowerCase(),
           getPostById.id,
           orgId,
-          getPostById.state === 'DRAFT' ? 'DRAFT' : 'QUEUE'
+          newDate.state
         );
       } catch (err) {}
     }
@@ -1460,13 +1574,11 @@ export class PostsService {
                 },
                 value: [
                   ...toPost.list.map((l) => ({
-                    id: '',
                     content: l.post,
                     delay: 0,
                     image: [],
                   })),
                   {
-                    id: '',
                     delay: 0,
                     content: `Check out the full story here:\n${
                       body.postId || body.url
@@ -1476,7 +1588,7 @@ export class PostsService {
                 ],
               },
             ],
-          },
+          } as CreatePostDto,
           'WEB'
         );
       }

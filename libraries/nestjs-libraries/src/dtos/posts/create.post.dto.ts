@@ -4,6 +4,7 @@ import {
   IsBoolean,
   IsDateString,
   IsDefined,
+  IsEnum,
   IsIn,
   IsNumber,
   IsOptional,
@@ -13,6 +14,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
+import { PostSaveAction } from '@prisma/client';
 import { MediaDto } from '@gitroom/nestjs-libraries/dtos/media/media.dto';
 import {
   allProviders,
@@ -99,6 +101,10 @@ export class CreatePostDto {
   @IsDefined()
   @IsIn(['draft', 'schedule', 'now', 'update'])
   type: 'draft' | 'schedule' | 'now' | 'update';
+
+  @IsOptional()
+  @IsEnum(PostSaveAction)
+  saveAction?: PostSaveAction;
 
   @IsOptional()
   @IsString()

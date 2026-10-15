@@ -1206,6 +1206,7 @@ const CalendarItem: FC<{
   display: 'day' | 'week' | 'month';
   showTime?: boolean;
   post: Post & {
+    saveAction?: string | null;
     integration: Integration;
     tags: {
       tag: Tags;
@@ -1294,6 +1295,11 @@ const CalendarItem: FC<{
             creationMethod={post.creationMethod}
             ringColor="var(--new-bgColor)"
           />
+        </div>
+      )}
+      {state === 'DRAFT' && post.saveAction === 'pass' && (
+        <div className="absolute -top-[6px] end-0 z-20 rounded-full border border-newTableBorder bg-btnSimple px-[6px] py-[2px] text-[10px] font-[600] leading-none text-btnText">
+          {t('rejected', 'Rejected')}
         </div>
       )}
       <div

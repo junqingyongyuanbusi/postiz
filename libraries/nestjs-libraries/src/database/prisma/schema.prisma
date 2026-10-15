@@ -457,6 +457,7 @@ model Comments {
 model Post {
   id                         String                    @id @default(cuid())
   state                      State                     @default(QUEUE)
+  saveAction                 PostSaveAction?
   publishDate                DateTime
   organizationId             String
   integrationId              String
@@ -1774,6 +1775,14 @@ enum State {
   PUBLISHED
   ERROR
   DRAFT
+}
+
+enum PostSaveAction {
+  draft
+  schedule
+  now
+  update
+  pass
 }
 
 enum SubscriptionTier {
