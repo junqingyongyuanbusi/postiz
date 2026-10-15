@@ -1588,7 +1588,7 @@ export class PostsService {
                 ],
               },
             ],
-          } as CreatePostDto,
+          },
           'WEB'
         );
       }
