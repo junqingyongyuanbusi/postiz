@@ -37,12 +37,14 @@ import { LanguageComponent } from '@gitroom/frontend/components/layout/language.
 import { ChromeExtensionComponent } from '@gitroom/frontend/components/layout/chrome.extension.component';
 import NotificationComponent from '@gitroom/frontend/components/notifications/notification.component';
 import { OrganizationSelector } from '@gitroom/frontend/components/layout/organization.selector';
+import { InvoicesComponent } from '@gitroom/frontend/components/layout/invoices.component';
 import { StreakComponent } from '@gitroom/frontend/components/layout/streak.component';
 import { PreConditionComponent } from '@gitroom/frontend/components/layout/pre-condition.component';
 import { AttachToFeedbackIcon } from '@gitroom/frontend/components/new-layout/sentry.feedback.component';
 import { FirstBillingComponent } from '@gitroom/frontend/components/billing/first.billing.component';
 import { TrialTracker } from '@gitroom/frontend/components/layout/gtm.component';
 import { setSentryUser } from '@gitroom/react/sentry/initialize.sentry.client';
+import { setUserTimezone } from '@gitroom/frontend/components/layout/set.timezone';
 
 export const LayoutComponent = ({ children }: { children: ReactNode }) => {
   const fetch = useFetch();
@@ -60,6 +62,8 @@ export const LayoutComponent = ({ children }: { children: ReactNode }) => {
     return await (await fetch(path)).json();
   }, []);
   const { data: user, mutate } = useSWR('/user/self', load, {
+    // set before anything renders a date in the user's timezone
+    onSuccess: (data) => setUserTimezone(data?.timezoneName),
     revalidateOnFocus: false,
     revalidateOnReconnect: false,
     revalidateIfStale: false,
@@ -138,7 +142,8 @@ export const LayoutComponent = ({ children }: { children: ReactNode }) => {
                       </div>
                     </div>
                     <div className="flex-1 min-w-0 bg-newBgLineColor rounded-[12px] overflow-hidden flex flex-col gap-[1px] blurMe">
-                      <div className="flex bg-newBgColorInner h-[80px] mobile:h-[64px] px-[20px] mobile:px-[12px] gap-[12px] items-center">
+                      {/* relative: the notifications popup spans this bar on phones */}
+                      <div className="relative flex bg-newBgColorInner h-[80px] mobile:h-[64px] px-[20px] mobile:px-[12px] gap-[12px] items-center">
                         <button
                           className="hidden mobile:flex items-center justify-center w-[36px] h-[36px] -ms-[6px] rounded-[8px] text-textItemBlur hover:text-newTextColor hover:bg-boxFocused"
                           onClick={() => setMenuOpen(true)}
@@ -166,6 +171,7 @@ export const LayoutComponent = ({ children }: { children: ReactNode }) => {
                           <StreakComponent />
                           <div className="w-[1px] h-[20px] bg-blockSeparator mobile:hidden" />
                           <OrganizationSelector />
+                          <InvoicesComponent />
                           <div className="hover:text-newTextColor">
                             <ModeComponent />
                           </div>

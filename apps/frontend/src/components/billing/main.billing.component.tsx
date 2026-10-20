@@ -8,7 +8,6 @@ import { useDebouncedCallback } from 'use-debounce';
 import ReactLoading from '@gitroom/frontend/components/layout/loading';
 import { deleteDialog } from '@gitroom/react/helpers/delete.dialog';
 import { useToaster } from '@gitroom/react/toaster/toaster';
-import dayjs from 'dayjs';
 import clsx from 'clsx';
 import { capitalize } from 'lodash';
 import { pricing } from '@gitroom/nestjs-libraries/database/prisma/subscriptions/pricing';
@@ -27,10 +26,12 @@ import { useTrack } from '@gitroom/react/helpers/use.track';
 import { TrackEnum } from '@gitroom/nestjs-libraries/user/track.enum';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { FinishTrial } from '@gitroom/frontend/components/billing/finish.trial';
-import { newDayjs } from '@gitroom/frontend/components/layout/set.timezone';
+import { fromUtc } from '@gitroom/frontend/components/layout/set.timezone';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { useDubClickId } from '@gitroom/frontend/components/layout/dubAnalytics';
 import { LogoutComponent } from '@gitroom/frontend/components/layout/logout.component';
+import useCookie from 'react-use-cookie';
+import { usePaymentAction } from '@gitroom/frontend/components/billing/use.payment.action';
 
 type SubscriptionWithPlatform = Subscription & {
   platform?: 'web' | 'mobile';
@@ -183,9 +184,7 @@ const BillingCycle: FC<{
                   )
                 : t('billing_renews_on', 'Your plan renews on')}{' '}
               <bdi className="font-[600] text-newTextColor">
-                {newDayjs(renewal.renewsAt * 1000)
-                  .local()
-                  .format('D MMM, YYYY')}
+                {fromUtc(renewal.renewsAt * 1000).format('D MMM, YYYY')}
               </bdi>
               {'. '}
             </>
@@ -464,8 +463,11 @@ export const MainBillingComponent: FC<{
   const { mutate } = useSWRConfig();
   const fetch = useFetch();
   const toast = useToaster();
+  const paymentAction = usePaymentAction();
   const user = useUser();
   const dub = useDubClickId();
+  const [fbc] = useCookie('_fbc', '');
+  const [fbp] = useCookie('_fbp', '');
   const modal = useModals();
   const router = useRouter();
   const utm = useUtmUrl();
@@ -475,6 +477,21 @@ export const MainBillingComponent: FC<{
   const [finishTrial, setFinishTrial] = useState(
     !!queryParams.get('finishTrial')
   );
+
+  const finishTrialNow = useCallback(async () => {
+    if (
+      await deleteDialog(
+        t(
+          'finish_trial_confirmation',
+          'Finishing the trial will charge your plan immediately, are you sure?'
+        ),
+        t('finish_trial_charge_me_now', 'Finish the trial, charge me now'),
+        t('trial', 'Trial')
+      )
+    ) {
+      setFinishTrial(true);
+    }
+  }, []);
 
   const [subscription, setSubscription] = useState<
     SubscriptionWithPlatform | undefined
@@ -679,7 +696,7 @@ export const MainBillingComponent: FC<{
           return;
         }
         setLoading(true);
-        const { url, portal, blocked } = await (
+        const { url, portal, blocked, requiresAction, clientSecret } = await (
           await fetch('/billing/subscribe', {
             method: 'POST',
             body: JSON.stringify({
@@ -687,6 +704,8 @@ export const MainBillingComponent: FC<{
               utm,
               billing,
               ...(dub ? { dub } : {}),
+              ...(fbc ? { fbc } : {}),
+              ...(fbp ? { fbp } : {}),
             }),
           })
         ).json();
@@ -708,6 +727,7 @@ export const MainBillingComponent: FC<{
               pricing[billing][
                 monthlyOrYearly === 'on' ? 'year_price' : 'month_price'
               ],
+            currency: 'USD',
           });
           window.location.href = url;
           return;
@@ -723,6 +743,14 @@ export const MainBillingComponent: FC<{
             window.open(portal);
           }
         } else {
+          if (requiresAction) {
+            const { error } = await paymentAction(clientSecret);
+            if (error) {
+              toast.show(error, 'warning');
+              setLoading(false);
+              return;
+            }
+          }
           setPeriod(monthlyOrYearly === 'on' ? 'YEARLY' : 'MONTHLY');
           setSubscription((subs) => ({
             ...subs!,
@@ -749,7 +777,7 @@ export const MainBillingComponent: FC<{
         }
         setLoading(false);
       },
-    [monthlyOrYearly, subscription, user, utm]
+    [monthlyOrYearly, subscription, user, utm, paymentAction]
   );
   if (user?.isLifetime) {
     router.replace('/');
@@ -803,10 +831,7 @@ export const MainBillingComponent: FC<{
       return {
         label: subscription?.cancelAt
           ? t('billing_downgrade_on', 'Downgrade on {{date}}', {
-              date: dayjs
-                .utc(subscription.cancelAt)
-                .local()
-                .format('D MMM, YYYY'),
+              date: fromUtc(subscription.cancelAt).format('D MMM, YYYY'),
             })
           : t('cancel_subscription_1', 'Cancel subscription'),
         onClick: moveToCheckout('FREE'),
@@ -834,7 +859,16 @@ export const MainBillingComponent: FC<{
 
   return (
     <div className="flex flex-col gap-[24px]">
-      {finishTrial && <FinishTrial close={() => setFinishTrial(false)} />}
+      {finishTrial && (
+        <FinishTrial
+          close={() => {
+            setFinishTrial(false);
+            mutate('/user/self');
+            mutate('/billing/invoices');
+            mutate('/billing/renewal');
+          }}
+        />
+      )}
       <div className="flex items-center gap-[16px] mobile:flex-col mobile:items-stretch">
         <div className="flex-1 flex flex-col gap-[4px]">
           <div className="text-[20px] font-[600]">
@@ -880,7 +914,7 @@ export const MainBillingComponent: FC<{
               'Your subscription will be canceled at'
             )}{' '}
             <bdi className="font-[600]">
-              {newDayjs(subscription.cancelAt).local().format('D MMM, YYYY')}
+              {fromUtc(subscription.cancelAt).format('D MMM, YYYY')}
             </bdi>
             {'. '}
             {t(
@@ -995,6 +1029,15 @@ export const MainBillingComponent: FC<{
             >
               {t('billing_update_payment_method', 'Update payment method')}
             </button>
+            {user?.isTrailing && (
+              <button
+                type="button"
+                onClick={finishTrialNow}
+                className="h-[44px] px-[16px] rounded-[8px] bg-btnSimple text-btnText text-[14px] font-[500] hover:opacity-80 transition-opacity"
+              >
+                {t('finish_trial', 'Finish trial')}
+              </button>
+            )}
           </div>
         </div>
       )}
