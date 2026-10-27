@@ -25,6 +25,7 @@ import { createReadStream, statSync } from 'fs';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import { setHeartbeatDetails } from '@gitroom/nestjs-libraries/temporal/temporal.heartbeat';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
+import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
 
 const clientAndYoutube = () => {
   const client = new google.auth.OAuth2({
@@ -350,6 +351,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     };
   }
 
+  @DashboardFunction()
   async pages(accessToken: string) {
     const { client, youtube } = clientAndYoutube();
     client.setCredentials({ access_token: accessToken });
@@ -481,7 +483,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       return Number(length);
     }
 
-    return statSync(path).size;
+    return statSync(this.localMediaPath(path, this.identifier)).size;
   }
 
   // Returns a streaming body for the [start, end] byte range of the media so we
@@ -517,7 +519,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       return response.body;
     }
 
-    return createReadStream(path, { start, end });
+    return createReadStream(this.localMediaPath(path, this.identifier), {
+      start,
+      end,
+    });
   }
 
   // Asks the upload session for the truth: the created video when the upload
