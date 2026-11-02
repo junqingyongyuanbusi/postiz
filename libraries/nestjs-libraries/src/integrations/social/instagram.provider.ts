@@ -71,6 +71,9 @@ export class InstagramProvider
         return 'Trial Reels must be a video';
       }
     }
+    if (firstPost?.some((f) => (f?.alt?.length ?? 0) > 1000)) {
+      return 'Instagram alt text can be up to 1000 characters';
+    }
     if (settings?.audio?.id) {
       if (settings?.post_type === 'story') {
         return 'Audio can only be added to Reels, not to Stories';
@@ -701,6 +704,46 @@ export class InstagramProvider
     return status_code;
   }
 
+  // After a rejected media_publish: the id of the media Instagram created from
+  // the container if it reports it as published, '' if it did not publish.
+  private async igPublishedMediaId(
+    containerId: string,
+    igId: string,
+    checkToken: string,
+    type: string
+  ): Promise<string> {
+    try {
+      const status = await this.igContainerStatus(
+        containerId,
+        checkToken,
+        type
+      );
+      const { data } =
+        status === 'PUBLISHED'
+          ? await (
+              await this.fetch(
+                `https://${type}/${META_GRAPH_API_VERSION}/${igId}/media?fields=id&limit=1&access_token=${checkToken}`,
+                undefined,
+                '',
+                0,
+                true
+              )
+            ).json()
+          : { data: [] };
+      const mediaId = data?.[0]?.id || '';
+      console.log(
+        `Instagram blocked media_publish for container ${containerId}: status ${status}, media ${mediaId || 'none'}`
+      );
+      return mediaId;
+    } catch (e) {
+      console.error(
+        `Instagram blocked media_publish for container ${containerId}: status probe failed`,
+        e
+      );
+      return '';
+    }
+  }
+
   // The post is live, the permalink is only cosmetic: never fail (and risk
   // re-publishing) a live post over it.
   private async igPermalink(
@@ -772,6 +815,13 @@ export class InstagramProvider
           ? `image_url=${m.path}&media_type=STORIES`
           : `image_url=${m.path}`;
 
+        // alt_text is only supported on images (single or carousel item),
+        // not on videos or stories
+        const altText =
+          m.alt && !isStory && !hasExtension(m.path, 'mp4')
+            ? `&alt_text=${encodeURIComponent(m.alt)}`
+            : ``;
+
         const trialParams = isTrialReel
           ? `&trial_params=${encodeURIComponent(
               JSON.stringify({
@@ -811,7 +861,7 @@ export class InstagramProvider
 
         const { id: photoId } = await (
           await this.fetch(
-            `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}&access_token=${accessToken}${caption}`,
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${altText}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}&access_token=${accessToken}${caption}`,
             {
               method: 'POST',
             }
@@ -1009,14 +1059,34 @@ export class InstagramProvider
         ? pendingData.carouselId
         : pendingData.containers[0];
 
-    const { id: mediaId } = await (
-      await this.fetch(
-        `https://${pendingData.type}/${META_GRAPH_API_VERSION}/${igId}/media_publish?creation_id=${creationId}&access_token=${accessToken}&field=id`,
-        {
-          method: 'POST',
-        }
-      )
-    ).json();
+    let mediaId: string;
+    try {
+      ({ id: mediaId } = await (
+        await this.fetch(
+          `https://${pendingData.type}/${META_GRAPH_API_VERSION}/${igId}/media_publish?creation_id=${creationId}&access_token=${accessToken}&field=id`,
+          {
+            method: 'POST',
+          }
+        )
+      ).json());
+    } catch (err) {
+      // Instagram sometimes answers media_publish with 2207051 ("action is
+      // blocked") and still publishes the container: ask Instagram before
+      // failing a post that may already be live.
+      if (!(err instanceof BadBody) || !err.message.includes('blocked')) {
+        throw err;
+      }
+
+      mediaId = await this.igPublishedMediaId(
+        creationId!,
+        igId,
+        checkToken,
+        pendingData.type
+      );
+      if (!mediaId) {
+        throw err;
+      }
+    }
 
     return {
       status: 'completed',
