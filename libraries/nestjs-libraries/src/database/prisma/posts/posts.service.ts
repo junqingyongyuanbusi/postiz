@@ -85,6 +85,10 @@ export class PostsService {
     return this._postRepository.searchForMissingThreeHoursPosts();
   }
 
+  getPostState(id: string) {
+    return this._postRepository.getPostState(id);
+  }
+
   updatePost(id: string, postId: string, releaseURL: string) {
     return this._postRepository.updatePost(id, postId, releaseURL);
   }
@@ -1531,7 +1535,6 @@ export class PostsService {
     if (action === 'schedule' && !republish) {
       this.guardAgainstRepublish(getPostById, 'changeDate');
     }
-
     // schedule: Set status to QUEUE and change date (reschedule the post)
     // update: Just change the date without changing the status
     const newDate = await this._postRepository.changeDate(

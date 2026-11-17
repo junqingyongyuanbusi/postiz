@@ -28,19 +28,29 @@ import { Provider } from '@prisma/client';
 import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import * as Sentry from '@sentry/nestjs';
 import { FarcasterProvider } from '@gitroom/nestjs-libraries/integrations/social/farcaster.provider';
+import { AttributionService } from '@gitroom/nestjs-libraries/services/attribution/attribution.service';
 
 @ApiTags('Auth')
 @Controller('/auth')
 export class AuthController {
   constructor(
     private _authService: AuthService,
-    private _emailService: EmailService
+    private _emailService: EmailService,
+    private _attributionService: AttributionService
   ) {}
 
   @Get('/can-register')
   async canRegister() {
     return {
       register: await this._authService.canRegister(Provider.LOCAL as string),
+    };
+  }
+
+  // URL parameters the app keeps until sign-up for the attribution tools
+  @Get('/attribution')
+  attribution() {
+    return {
+      params: this._attributionService.queryParams(),
     };
   }
 
@@ -348,12 +358,20 @@ export class AuthController {
       return response.status(400).send('Invalid request');
     }
 
-    const { jwt, token } = await this._authService.checkExists(
+    // Existing-user OAuth login: this path doesn't run routeAuth, so read the
+    // org invite cookie and join the org here too (when the invite is valid).
+    // See register/login for the same logic.
+    const getOrgFromCookie = this._authService.getOrgFromCookie(
+      req?.cookies?.org
+    );
+
+    const { jwt, token, addedOrg } = await this._authService.checkExists(
       provider,
       code,
       redirect_uri,
       state,
-      req?.cookies?.oauth_state
+      req?.cookies?.oauth_state,
+      getOrgFromCookie
     );
 
     if (token) {
@@ -374,6 +392,27 @@ export class AuthController {
 
     if (process.env.NOT_SECURED) {
       response.header('auth', jwt);
+    }
+
+    // Joined a new org via the invite: tell the frontend to switch the active
+    // org to it (mirrors register/login). showorg is also a header so the
+    // NOT_SECURED setup, which can't set cross-site cookies, still works.
+    if (typeof addedOrg !== 'boolean' && addedOrg?.organizationId) {
+      response.cookie('showorg', addedOrg.organizationId, {
+        domain: getCookieUrlFromDomain(process.env.FRONTEND_URL!),
+        ...(!process.env.NOT_SECURED
+          ? {
+              secure: true,
+              httpOnly: true,
+              sameSite: 'none',
+            }
+          : {}),
+        expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365),
+      });
+
+      if (process.env.NOT_SECURED) {
+        response.header('showorg', addedOrg.organizationId);
+      }
     }
 
     response.header('reload', 'true');

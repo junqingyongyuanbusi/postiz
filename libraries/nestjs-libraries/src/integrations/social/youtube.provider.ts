@@ -17,6 +17,7 @@ import {
   RefreshToken,
   SocialAbstract,
   ValidityMedia,
+  rangeReadFailure,
   stripQuery,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import * as process from 'node:process';
@@ -55,7 +56,12 @@ const clientAndYoutube = () => {
   return { client, youtube, oauth2, youtubeAnalytics };
 };
 
-@Rules('YouTube must have on video attachment, it cannot be empty')
+@Rules(
+  [
+    'YouTube must have on video attachment, it cannot be empty.',
+    'If the video was made or altered with AI, ask the user if they want to mark it as AI, and set made_with_ai to true only when they say yes. YouTube asks for it only when the content looks realistic, not for animation or clearly unrealistic content.',
+  ].join(' ')
+)
 export class YoutubeProvider extends SocialAbstract implements SocialProvider {
   override maxConcurrentJob = 200; // YouTube has strict upload quotas
   identifier = 'youtube';
@@ -508,9 +514,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       // A store that ignores Range (200 with the full file) or answers with an
       // error page would corrupt the upload at this offset.
       if (response.status !== 206) {
+        await response.body?.cancel().catch(() => {});
         throw new BadBody(
           this.identifier,
-          '{}',
+          rangeReadFailure(response),
           '{}',
           'The media storage did not return the requested byte range, please try again'
         );
@@ -620,6 +627,9 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
           status: {
             privacyStatus: settings.type,
             selfDeclaredMadeForKids: settings.selfDeclaredMadeForKids === 'yes',
+            ...(this.assetBoolean(settings.made_with_ai)
+              ? { containsSyntheticMedia: true }
+              : {}),
           },
         }),
       }

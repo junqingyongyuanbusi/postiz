@@ -5,7 +5,8 @@ import { SubscriptionService } from '@gitroom/nestjs-libraries/database/prisma/s
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { BillingSubscribeDto } from '@gitroom/nestjs-libraries/dtos/billing/billing.subscribe.dto';
-import { groupBy } from 'lodash';
+import { groupBy, omit } from 'lodash';
+import dayjs from 'dayjs';
 import { pricing } from '@gitroom/nestjs-libraries/database/prisma/subscriptions/pricing';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
@@ -124,24 +125,54 @@ export class StripeService extends PaymentProviderAbstract {
         confirm: true, // Confirm the PaymentIntent
       });
 
-      if (paymentIntent.status !== 'requires_capture') {
-        console.error('Cant charge');
-        await stripe.paymentMethods.detach(paymentMethods.data[0].id);
-        await stripe.subscriptions.cancel(event.data.object.id as string);
-        return false;
+      if (paymentIntent.status === 'requires_capture') {
+        await stripe.paymentIntents.cancel(paymentIntent.id as string);
+        return true;
       }
 
-      await stripe.paymentIntents.cancel(paymentIntent.id as string);
-      return true;
+      console.error('Cant charge', {
+        stripe_event_id: event.id,
+        stripe_subscription_id: event.data.object.id,
+        stripe_payment_intent_status: paymentIntent.status,
+      });
     } catch (err) {
-      try {
-        await stripe.paymentMethods.detach(paymentMethods.data[0].id);
-        await stripe.subscriptions.cancel(event.data.object.id as string);
-      } catch (err) {
-        /*dont do anything*/
-      }
-      return false;
+      console.error(
+        'stripe_card_check_failed',
+        {
+          stripe_event_id: event.id,
+          stripe_subscription_id: event.data.object.id,
+        },
+        err
+      );
     }
+
+    try {
+      await stripe.subscriptions.cancel(event.data.object.id as string);
+    } catch (err) {
+      console.error(
+        'stripe_card_check_cancel_failed',
+        {
+          stripe_event_id: event.id,
+          stripe_subscription_id: event.data.object.id,
+        },
+        err
+      );
+    }
+
+    try {
+      await stripe.paymentMethods.detach(paymentMethods.data[0].id);
+    } catch (err) {
+      console.error(
+        'stripe_card_check_detach_failed',
+        {
+          stripe_event_id: event.id,
+          stripe_subscription_id: event.data.object.id,
+        },
+        err
+      );
+    }
+
+    return false;
   }
 
   async createSubscription(event: Stripe.CustomerSubscriptionCreatedEvent) {
@@ -234,6 +265,8 @@ export class StripeService extends PaymentProviderAbstract {
   }
 
   async deleteSubscription(event: Stripe.CustomerSubscriptionDeletedEvent) {
+    // runs in the background so it can never fail or slow down the webhook
+    this.keepCardOfUnpaidInvoices(event.data.object.id).catch((err) => {});
     const customer = event.data.object.customer as string;
     const [survivor] = await this.getLiveSubscriptions(customer);
     if (!survivor) {
@@ -270,6 +303,80 @@ export class StripeService extends PaymentProviderAbstract {
       period,
       survivor.cancel_at
     );
+  }
+
+  // Never throws, it is used by code that runs inside Stripe webhooks.
+  private async getInvoicePaymentIntents(invoiceId: string) {
+    try {
+      const invoice = await stripe.invoices.retrieve(invoiceId, {
+        expand: ['payments.data.payment.payment_intent'],
+      });
+      return (invoice.payments?.data || [])
+        .map((p) => p.payment.payment_intent)
+        .filter(
+          (p): p is Stripe.PaymentIntent => typeof p === 'object' && !!p
+        );
+    } catch (err) {
+      console.error(
+        'stripe_invoice_payment_intents_failed',
+        { stripe_invoice_id: invoiceId },
+        err
+      );
+      return [];
+    }
+  }
+
+  // Stripe's hosted invoice page keeps the paying card only when the customer
+  // has no default card, the flag makes it keep the card in every case.
+  // Never throws, a failure on one invoice does not stop the others.
+  private async keepCardOfUnpaidInvoices(subscriptionId: string) {
+    try {
+      const invoices = await stripe.invoices.list({
+        subscription: subscriptionId,
+        limit: 100,
+      });
+      for (const invoice of invoices.data) {
+        if (invoice.status !== 'open' && invoice.status !== 'uncollectible') {
+          continue;
+        }
+
+        const paymentIntents = await this.getInvoicePaymentIntents(invoice.id);
+        for (const paymentIntent of paymentIntents) {
+          // the only statuses Stripe lets the flag be set on
+          if (
+            paymentIntent.setup_future_usage ||
+            ![
+              'requires_payment_method',
+              'requires_confirmation',
+              'requires_action',
+            ].includes(paymentIntent.status)
+          ) {
+            continue;
+          }
+
+          try {
+            await stripe.paymentIntents.update(paymentIntent.id, {
+              setup_future_usage: 'off_session',
+            });
+          } catch (err) {
+            console.error(
+              'stripe_keep_card_of_unpaid_invoices_failed',
+              {
+                stripe_subscription_id: subscriptionId,
+                stripe_invoice_id: invoice.id,
+              },
+              err
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.error(
+        'stripe_keep_card_of_unpaid_invoices_failed',
+        { stripe_subscription_id: subscriptionId },
+        err
+      );
+    }
   }
 
   // After a login swap, move each Stripe customer's email to the login that
@@ -463,7 +570,7 @@ export class StripeService extends PaymentProviderAbstract {
     );
   }
 
-  async setToCancel(organizationId: string) {
+  async setToCancel(organizationId: string, cancel?: boolean) {
     const id = makeId(10);
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
@@ -477,6 +584,13 @@ export class StripeService extends PaymentProviderAbstract {
 
     // If the user is toggling back (un-cancelling), just remove the cancel
     if (sub.cancel_at_period_end) {
+      if (cancel) {
+        return {
+          id,
+          cancel_at: sub.cancel_at ? new Date(sub.cancel_at * 1000) : undefined,
+          unchanged: true,
+        };
+      }
       let cancel_at: number | null = null;
       for (const s of subscriptions) {
         const updated = await stripe.subscriptions.update(s.id, {
@@ -493,6 +607,10 @@ export class StripeService extends PaymentProviderAbstract {
       };
     }
 
+    if (cancel === false) {
+      return { id, cancel_at: undefined, unchanged: true };
+    }
+
     // Check if the latest invoice has a failed payment
     const latestInvoice = sub.latest_invoice as Stripe.Invoice | null;
     const hasFailedPayment =
@@ -505,6 +623,7 @@ export class StripeService extends PaymentProviderAbstract {
       for (const s of subscriptions) {
         await stripe.subscriptions.cancel(s.id);
       }
+      await this.voidUnpaidInvoices(customer);
       await this._subscriptionService.deleteSubscription(
         customer,
         STRIPE_PROVIDER
@@ -557,6 +676,7 @@ export class StripeService extends PaymentProviderAbstract {
     )) {
       await stripe.subscriptions.cancel(subscription.id);
     }
+    await this.voidUnpaidInvoices(org.paymentId);
 
     await this._subscriptionService.deleteSubscription(
       org.paymentId,
@@ -906,7 +1026,7 @@ export class StripeService extends PaymentProviderAbstract {
       ).data.find((f) => f.status === 'active' || f.status === 'trialing'),
     };
 
-    if (!currentUserSubscription) {
+    if (!currentUserSubscription.data) {
       return false;
     }
 
@@ -923,7 +1043,7 @@ export class StripeService extends PaymentProviderAbstract {
 
   async applyDiscount(organization: Organization) {
     const customer = organization.paymentId;
-    const check = this.checkDiscount(organization);
+    const check = await this.checkDiscount(organization);
     if (!check) {
       return false;
     }
@@ -1165,7 +1285,276 @@ export class StripeService extends PaymentProviderAbstract {
     // only feeds the Facebook pixel, it runs in the background so it can
     // never fail or slow down the webhook
     this.trackConversion(event.data.object).catch((err) => {});
+    // the first payment of a new subscription makes the unpaid invoices of
+    // the cancelled ones obsolete
+    if (event.data.object.billing_reason === 'subscription_create') {
+      await this.voidUnpaidInvoices(event.data.object.customer as string);
+    }
+    await this.resubscribeOnLatePayment(event.data.object);
     return { ok: true };
+  }
+
+  // An invoice left unpaid by a cancelled subscription stays payable. Paying
+  // it buys one period on the same plan, starting now.
+  // Never throws, it runs inside the invoice.payment_succeeded webhook.
+  private async resubscribeOnLatePayment(invoice: Stripe.Invoice) {
+    try {
+      // only a renewal (or a trial's first charge) bills one full period at
+      // the plan's price, a proration invoice from an upgrade does not
+      const paidAt = invoice.status_transitions?.paid_at;
+      const subscriptionId =
+        invoice.parent?.subscription_details?.subscription ||
+        (invoice as any).subscription;
+      if (
+        invoice.billing_reason !== 'subscription_cycle' ||
+        !(invoice.amount_paid > 0) ||
+        invoice.amount_remaining > 0 ||
+        !paidAt ||
+        !subscriptionId
+      ) {
+        return;
+      }
+
+      const subscription = await stripe.subscriptions.retrieve(
+        typeof subscriptionId === 'string' ? subscriptionId : subscriptionId.id,
+        { expand: ['discounts.source.coupon'] }
+      );
+      if (
+        subscription.metadata?.service !== 'gitroom' ||
+        subscription.status !== 'canceled'
+      ) {
+        return;
+      }
+
+      // only a payment made after the subscription ended is a late payment:
+      // Stripe redelivers the event of an earlier payment when the webhook
+      // was down, and canceled_at is the request time of a period-end cancel
+      const endedAt = subscription.ended_at || subscription.canceled_at;
+      if (!endedAt || paidAt <= endedAt) {
+        return;
+      }
+
+      const customer = subscription.customer as string;
+      const skipped = (reason: string) =>
+        console.log('stripe_late_payment_resubscribe_skipped', {
+          stripe_invoice_id: invoice.id,
+          stripe_subscription_id: subscription.id,
+          stripe_customer_id: customer,
+          reason,
+        });
+
+      // runs once: not when a subscription is live, and not when one was
+      // already created for this payment (the event may be redelivered later)
+      const others = await stripe.subscriptions.list({
+        customer,
+        status: 'all',
+        limit: 100,
+      });
+      if (
+        others.data.some(
+          (f) =>
+            f.id !== subscription.id &&
+            (f.created >= paidAt ||
+              !['canceled', 'incomplete', 'incomplete_expired'].includes(
+                f.status
+              ))
+        )
+      ) {
+        return skipped('other_subscription');
+      }
+
+      const org = await this._organizationService.getOrgByCustomerId(customer);
+      if (!org || org.deletedAt) {
+        return skipped('organization_missing');
+      }
+      // a lifetime deal, a store subscription or a row the webhooks have not
+      // removed: the organization is not locked out, nothing to restore
+      if (
+        await this._subscriptionService.getSubscriptionByOrganizationId(org.id)
+      ) {
+        return skipped('organization_has_subscription');
+      }
+      // the rule every checkout applies: one subscription per email
+      const team = await this._organizationService.getTeam(org.id);
+      for (const { user } of (team?.users || []).filter(
+        (u) => u.role === 'SUPERADMIN'
+      )) {
+        if (
+          await this._userService.getUserWithActiveSubscriptionByEmail(
+            user.email,
+            user.id
+          )
+        ) {
+          return skipped('other_account_subscribed');
+        }
+      }
+
+      const { billing, period } = subscription.metadata as {
+        billing: 'STANDARD' | 'PRO';
+        period: 'MONTHLY' | 'YEARLY';
+      };
+      if (!pricing[billing] || !period) {
+        return skipped('metadata_missing');
+      }
+
+      // the invoice must bill one period of the subscription's own price, an
+      // upgrade after the invoice was issued swaps the item for a dearer one.
+      // Webhook payloads follow the API version of the endpoint: pricing is
+      // the 2025-03-31+ shape of a line, price the older one
+      const item = subscription.items.data[0];
+      const [line, ...moreLines] = invoice.lines?.data || [];
+      const linePrice =
+        line?.pricing?.price_details?.price || (line as any)?.price;
+      if (
+        !item ||
+        !line ||
+        moreLines.length ||
+        (typeof linePrice === 'string' ? linePrice : linePrice?.id) !==
+          item.price.id ||
+        line.quantity !== item.quantity
+      ) {
+        return skipped('invoice_does_not_match_plan');
+      }
+
+      // the discounts the customer had keep applying, except a one-off coupon
+      // (used up by the paid invoice) and a discount that has already ended
+      const discounts = subscription.discounts
+        .map((d) => (typeof d === 'string' ? null : d))
+        .filter((d): d is Stripe.Discount => !!d && (!d.end || d.end > paidAt))
+        .map((d) => d.source?.coupon)
+        .filter(
+          (c): c is Stripe.Coupon =>
+            typeof c === 'object' && !!c && c.valid && c.duration !== 'once'
+        )
+        .map((c) => ({ coupon: c.id }));
+
+      const card = await this.getCardKeptByInvoice(invoice.id, customer);
+      const created = await stripe.subscriptions.create(
+        {
+          customer,
+          ...(card ? { default_payment_method: card } : {}),
+          items: [{ price: item.price.id, quantity: item.quantity }],
+          ...(discounts.length ? { discounts } : {}),
+          // the pixel keys attribute the checkout conversion, this is a
+          // continuation of it, not a new one
+          metadata: omit(subscription.metadata, ['userId', 'fbc', 'fbp']),
+          // Stripe rejects an anchor later than one period from its own
+          // clock, so the period is counted from Stripe's payment time
+          billing_cycle_anchor: dayjs(paidAt * 1000)
+            .add(
+              item.price.recurring!.interval_count,
+              item.price.recurring!.interval
+            )
+            .unix(),
+          proration_behavior: 'none',
+        },
+        { idempotencyKey: `resubscribe_${invoice.id}` }
+      );
+      console.log('stripe_late_payment_resubscribed', {
+        stripe_invoice_id: invoice.id,
+        stripe_subscription_id: subscription.id,
+        stripe_new_subscription_id: created.id,
+        stripe_payment_method_id: card || null,
+        stripe_coupon_ids: discounts.map((d) => d.coupon),
+      });
+
+      await this.voidUnpaidInvoices(customer);
+    } catch (err) {
+      console.error(
+        'stripe_late_payment_resubscribe_failed',
+        {
+          stripe_invoice_id: invoice.id,
+          stripe_customer_id:
+            typeof invoice.customer === 'string' ? invoice.customer : null,
+        },
+        err
+      );
+    }
+  }
+
+  // Never throws.
+  private async getCardKeptByInvoice(invoiceId: string, customer: string) {
+    try {
+      const paid = (await this.getInvoicePaymentIntents(invoiceId)).find(
+        (p) => p.status === 'succeeded'
+      );
+      const card =
+        typeof paid?.payment_method === 'string'
+          ? paid.payment_method
+          : paid?.payment_method?.id;
+      if (!card) {
+        return undefined;
+      }
+
+      const owner = (await stripe.paymentMethods.retrieve(card)).customer;
+      return (typeof owner === 'string' ? owner : owner?.id) === customer
+        ? card
+        : undefined;
+    } catch (err) {
+      console.error(
+        'stripe_card_kept_by_invoice_failed',
+        { stripe_invoice_id: invoiceId, stripe_customer_id: customer },
+        err
+      );
+      return undefined;
+    }
+  }
+
+  // Unpaid invoices of cancelled subscriptions stay payable, void them so
+  // they can't be paid for a period that is no longer provided.
+  // Never throws, a failure on one invoice does not stop the others.
+  private async voidUnpaidInvoices(customer?: string | null) {
+    try {
+      if (!customer || !customer.startsWith('cus_')) {
+        return;
+      }
+
+      const cancelled = (
+        await stripe.subscriptions.list({
+          customer,
+          status: 'canceled',
+          limit: 100,
+        })
+      ).data
+        .filter((f) => f.metadata?.service === 'gitroom')
+        .map((f) => f.id);
+      if (!cancelled.length) {
+        return;
+      }
+
+      for (const status of ['open', 'uncollectible'] as const) {
+        const invoices = await stripe.invoices.list({
+          customer,
+          status,
+          limit: 100,
+        });
+        for (const invoice of invoices.data) {
+          const subscription =
+            invoice.parent?.subscription_details?.subscription;
+          const subscriptionId =
+            typeof subscription === 'string' ? subscription : subscription?.id;
+          if (!subscriptionId || !cancelled.includes(subscriptionId)) {
+            continue;
+          }
+
+          try {
+            await stripe.invoices.voidInvoice(invoice.id);
+          } catch (err) {
+            console.error(
+              'stripe_void_unpaid_invoices_failed',
+              { stripe_customer_id: customer, stripe_invoice_id: invoice.id },
+              err
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.error(
+        'stripe_void_unpaid_invoices_failed',
+        { stripe_customer_id: customer },
+        err
+      );
+    }
   }
 
   // The first charge of a subscription is the conversion: a trial that turned
@@ -1286,6 +1675,7 @@ export class StripeService extends PaymentProviderAbstract {
         status: charge.status,
         refunded: charge.refunded,
         amount_refunded: charge.amount_refunded,
+        disputed: charge.disputed,
         description: charge.description,
         receipt_url: charge.receipt_url || null,
         invoice: (charge as any).invoice || null,
@@ -1307,13 +1697,30 @@ export class StripeService extends PaymentProviderAbstract {
       }
     }
 
+    const disputedMap: Record<string, boolean> = {};
+    for (const charge of chargeList.filter((f) => f.disputed)) {
+      try {
+        disputedMap[charge.id] = await this.hasUnresolvedDispute(charge.id);
+      } catch {
+        disputedMap[charge.id] = true;
+      }
+    }
+
     return chargeList.map((charge) => ({
       ...charge,
+      disputed: !!disputedMap[charge.id],
       invoice_pdf:
         charge.invoice && invoicePdfMap[charge.invoice as string]
           ? invoicePdfMap[charge.invoice as string]
           : null,
     }));
+  }
+
+  private async hasUnresolvedDispute(chargeId: string) {
+    const disputes = await stripe.disputes.list({ charge: chargeId });
+    return disputes.data.some(
+      (f) => f.status !== 'won' && f.status !== 'warning_closed'
+    );
   }
 
   async refundCharges(organizationId: string, chargeIds: string[]) {
@@ -1324,17 +1731,31 @@ export class StripeService extends PaymentProviderAbstract {
 
     const refunded: string[] = [];
     const failed: string[] = [];
+    let reason: string | undefined = undefined;
 
     for (const chargeId of chargeIds) {
       try {
+        if (await this.hasUnresolvedDispute(chargeId)) {
+          failed.push(chargeId);
+          reason =
+            reason ||
+            `Charge ${chargeId} was disputed and thus cannot be refunded`;
+          continue;
+        }
         await stripe.refunds.create({ charge: chargeId });
         refunded.push(chargeId);
       } catch (err) {
+        console.error(
+          'stripe_refund_charge_failed',
+          { organization_id: organizationId, stripe_charge_id: chargeId },
+          err
+        );
         failed.push(chargeId);
+        reason = reason || (err as any)?.message;
       }
     }
 
-    return { refunded, failed };
+    return { refunded, failed, reason };
   }
 
   async cancelSubscription(organizationId: string) {
@@ -1354,6 +1775,7 @@ export class StripeService extends PaymentProviderAbstract {
     for (const subscription of subscriptions) {
       await stripe.subscriptions.cancel(subscription.id);
     }
+    await this.voidUnpaidInvoices(customer);
     await this._subscriptionService.deleteSubscription(
       customer,
       STRIPE_PROVIDER
@@ -1666,6 +2088,7 @@ export class StripeService extends PaymentProviderAbstract {
     for (const subscriptionId of preview.subscriptionIds) {
       await stripe.subscriptions.cancel(subscriptionId);
     }
+    await this.voidUnpaidInvoices(org?.paymentId);
 
     if (preview.subscriptionIds.length) {
       await this._subscriptionService.deleteSubscription(

@@ -19,7 +19,6 @@ import { useUser } from '@gitroom/frontend/components/layout/user.context';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { useModals } from '@gitroom/frontend/components/layout/new-modal';
-import { Textarea } from '@gitroom/react/form/textarea';
 import { useFireEvents } from '@gitroom/helpers/utils/use.fire.events';
 import { useUtmUrl } from '@gitroom/helpers/utils/utm.saver';
 import { useTrack } from '@gitroom/react/helpers/use.track';
@@ -386,6 +385,7 @@ const Accept: FC<{ resolve: (res: boolean) => void }> = ({ resolve }) => {
   const [loading, setLoading] = useState(false);
   const fetch = useFetch();
   const toaster = useToaster();
+  const t = useT();
 
   const apply = useCallback(async () => {
     setLoading(true);
@@ -402,54 +402,18 @@ const Accept: FC<{ resolve: (res: boolean) => void }> = ({ resolve }) => {
       <div className="mb-[20px]">
         Would you accept 50% discount for 3 months instead? 🙏🏻
       </div>
+      <div className="mb-[20px] text-[14px] text-textItemBlur">
+        {t(
+          'billing_discount_modal_still_active',
+          'Your subscription is still active. Choose one of the options below to continue.'
+        )}
+      </div>
       <div className="flex gap-[10px]">
         <Button loading={loading} onClick={apply}>
           Apply 50% discount for 3 months
         </Button>
         <Button onClick={() => resolve(false)} className="!bg-red-800">
           Cancel my subscription
-        </Button>
-      </div>
-    </div>
-  );
-};
-const Info: FC<{
-  proceed: (feedback: string) => void;
-}> = (props) => {
-  const [feedback, setFeedback] = useState('');
-  const modal = useModals();
-  const events = useFireEvents();
-  const cancel = useCallback(() => {
-    props.proceed(feedback);
-    events('cancel_subscription');
-    modal.closeAll();
-  }, [modal, feedback]);
-
-  const t = useT();
-
-  return (
-    <div className="relative flex gap-[20px] flex-col flex-1 rounded-[4px]">
-      <div>
-        {t(
-          'would_you_mind_shortly_tell_us_what_we_could_have_done_better',
-          'Would you mind shortly tell us what we could have done better?'
-        )}
-      </div>
-      <div>
-        <Textarea
-          className="bg-newBgColorInner"
-          label={'Feedback'}
-          name="feedback"
-          disableForm={true}
-          value={feedback}
-          onChange={(e) => setFeedback(e.target.value)}
-        />
-      </div>
-      <div>
-        <Button disabled={feedback.length < 20} onClick={cancel}>
-          {feedback.length < 20
-            ? t('please_add_at_least', 'Please add at least 20 chars')
-            : t('cancel_subscription', 'Cancel Subscription')}
         </Button>
       </div>
     </div>
@@ -468,6 +432,7 @@ export const MainBillingComponent: FC<{
   const dub = useDubClickId();
   const [fbc] = useCookie('_fbc', '');
   const [fbp] = useCookie('_fbp', '');
+  const events = useFireEvents();
   const modal = useModals();
   const router = useRouter();
   const utm = useUtmUrl();
@@ -483,7 +448,7 @@ export const MainBillingComponent: FC<{
       await deleteDialog(
         t(
           'finish_trial_confirmation',
-          "Ending the trial charges your plan's first payment today instead of at the end of the trial. Nothing extra is added. Continue?"
+          "Ending the trial charges your plan's first payment today instead of at the end of the trial. Continue?"
         ),
         t('finish_trial_charge_me_now', 'End trial and pay now'),
         t('trial', 'Trial')
@@ -572,12 +537,7 @@ export const MainBillingComponent: FC<{
           const { cancel_at } = await (
             await fetch('/billing/cancel', {
               method: 'POST',
-              body: JSON.stringify({
-                feedback: '',
-              }),
-              headers: {
-                'Content-Type': 'application/json',
-              },
+              body: JSON.stringify({ cancel: false }),
             })
           ).json();
           setSubscription((subs) => ({
@@ -628,63 +588,67 @@ export const MainBillingComponent: FC<{
               'No, keep it'
             ))
           ) {
-            const checkDiscount = await (
-              await fetch('/billing/check-discount')
-            ).json();
-            if (checkDiscount.offerCoupon) {
-              const info = await new Promise((res) => {
-                modal.openModal({
-                  title: 'Before you cancel',
-                  withCloseButton: true,
-                  classNames: {
-                    modal: 'bg-transparent text-textColor',
-                  },
-                  children: <Accept resolve={res} />,
+            try {
+              const checkDiscount = await (
+                await fetch('/billing/check-discount')
+              ).json();
+              if (checkDiscount.offerCoupon) {
+                const info = await new Promise((res) => {
+                  modal.openModal({
+                    title: 'Before you cancel',
+                    withCloseButton: true,
+                    onClose: () => {
+                      toast.show(
+                        t(
+                          'billing_subscription_not_cancelled',
+                          'Your subscription was not cancelled'
+                        ),
+                        'warning'
+                      );
+                      res(true);
+                    },
+                    classNames: {
+                      modal: 'bg-transparent text-textColor',
+                    },
+                    children: <Accept resolve={res} />,
+                  });
                 });
-              });
 
-              modal.closeAll();
+                modal.closeAll();
 
-              if (info) {
-                return;
+                if (info) {
+                  return;
+                }
               }
-            }
 
-            const info = await new Promise((res) => {
-              modal.openModal({
-                title: t(
-                  'we_are_sorry_to_see_you_go',
-                  'We are sorry to see you go :('
-                ),
-                withCloseButton: true,
-                classNames: {
-                  modal: 'bg-transparent text-textColor',
-                },
-                children: <Info proceed={(e) => res(e)} />,
-              });
-            });
-
-            setLoading(true);
-            const { cancel_at } = await (
-              await fetch('/billing/cancel', {
+              events('cancel_subscription');
+              setLoading(true);
+              const response = await fetch('/billing/cancel', {
                 method: 'POST',
-                body: JSON.stringify({
-                  feedback: info,
-                }),
-                headers: {
-                  'Content-Type': 'application/json',
-                },
-              })
-            ).json();
-            setSubscription((subs) => ({
-              ...subs!,
-              cancelAt: cancel_at,
-            }));
-            toast.show(
-              cancel_at
-                ? 'Subscription set to canceled successfully'
-                : 'Your subscription was already set to cancel, so it has been reactivated. Click Cancel subscription again to cancel it.'
-            );
+                body: JSON.stringify({ cancel: true }),
+              });
+              if (!response.ok) {
+                throw new Error(`status ${response.status}`);
+              }
+              const { cancel_at } = await response.json();
+              setSubscription((subs) => ({
+                ...subs!,
+                cancelAt: cancel_at,
+              }));
+              toast.show(
+                cancel_at
+                  ? 'Subscription set to canceled successfully'
+                  : 'Your subscription was already set to cancel, so it has been reactivated. Click Cancel subscription again to cancel it.'
+              );
+            } catch (err) {
+              toast.show(
+                t(
+                  'billing_cancel_failed',
+                  'We could not cancel your subscription. Please try again or contact support.'
+                ),
+                'warning'
+              );
+            }
             setLoading(false);
           }
           return;
@@ -1029,13 +993,13 @@ export const MainBillingComponent: FC<{
             >
               {t('billing_update_payment_method', 'Update payment method')}
             </button>
-            {user?.isTrailing && (
+            {user?.isTrailing && !subscription?.cancelAt && (
               <button
                 type="button"
                 onClick={finishTrialNow}
                 className="h-[44px] px-[16px] rounded-[8px] bg-btnSimple text-btnText text-[14px] font-[500] hover:opacity-80 transition-opacity"
               >
-                {t('finish_trial', 'Finish trial')}
+                {t('finish_trial_charge_me_now', 'End trial and pay now')}
               </button>
             )}
           </div>

@@ -11,6 +11,7 @@ import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.po
 import {
   APPROVED_SUBMIT_FOR_ORDER,
   CreationMethod,
+  Integration,
   Post,
   PostSaveAction,
   Prisma,
@@ -25,6 +26,10 @@ import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
 import utc from 'dayjs/plugin/utc';
 import { v4 as uuidv4 } from 'uuid';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
+import {
+  EncryptionService,
+  integrationEncryptedFields,
+} from '@gitroom/nestjs-libraries/services/encryption.service';
 
 dayjs.extend(isoWeek);
 dayjs.extend(weekOfYear);
@@ -40,8 +45,26 @@ export class PostsRepository {
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
     private _errors: PrismaRepository<'errors'>,
-    private _transaction: PrismaTransaction
+    private _transaction: PrismaTransaction,
+    private _encryptionService: EncryptionService
   ) {}
+
+  // A post that was loaded with its whole channel carries the tokens of the
+  // channel the way they are stored, so they are decrypted like in the
+  // integration repository
+  private async decryptIntegration<T extends { integration?: Integration | null }>(
+    post: T | null
+  ) {
+    return post?.integration
+      ? {
+          ...post,
+          integration: await this._encryptionService.decryptFields(
+            post.integration,
+            integrationEncryptedFields
+          ),
+        }
+      : post;
+  }
 
   searchForMissingThreeHoursPosts() {
     return this._post.model.post.findMany({
@@ -69,6 +92,18 @@ export class PostsRepository {
           },
         },
         publishDate: true,
+      },
+    });
+  }
+
+  getPostState(id: string) {
+    return this._post.model.post.findUnique({
+      where: {
+        id,
+        deletedAt: null,
+      },
+      select: {
+        state: true,
       },
     });
   }
@@ -167,97 +202,122 @@ export class PostsRepository {
     const startDate = dayjs.utc(query.startDate).toDate();
     const endDate = dayjs.utc(query.endDate).toDate();
 
-    const list = await this._post.model.post.findMany({
-      where: {
-        AND: [
-          {
-            OR: [
-              {
-                organizationId: orgId,
-              },
-            ],
-          },
-          {
-            OR: [
-              {
-                publishDate: {
-                  gte: startDate,
-                  lte: endDate,
-                },
-              },
-              {
-                intervalInDays: {
-                  not: null,
-                },
-              },
-            ],
-          },
-        ],
-        integration: {
-          deletedAt: null,
-          organizationId: orgId,
-          ...(query.customer ? { customerId: query.customer } : {}),
-        },
-        deletedAt: null,
-        parentPostId: null,
-      },
-      select: {
-        id: true,
-        content: true,
-        publishDate: true,
-        releaseURL: true,
-        releaseId: true,
-        state: true,
-        error: true,
-        saveAction: true,
-        intervalInDays: true,
-        group: true,
-        creationMethod: true,
-        settings: true,
-        tags: {
-          where: {
-            tag: {
-              deletedAt: null,
+    const whereBase = {
+      AND: [
+        {
+          OR: [
+            {
+              organizationId: orgId,
             },
-          },
-          select: {
-            tag: true,
+          ],
+        },
+      ],
+      integration: {
+        deletedAt: null as any,
+        organizationId: orgId,
+        ...(query.customer ? { customerId: query.customer } : {}),
+      },
+      deletedAt: null as Date | null,
+      parentPostId: null as string | null,
+    };
+
+    const select = {
+      id: true,
+      content: true,
+      publishDate: true,
+      releaseURL: true,
+      releaseId: true,
+      state: true,
+      error: true,
+      saveAction: true,
+      intervalInDays: true,
+      group: true,
+      creationMethod: true,
+      settings: true,
+      tags: {
+        where: {
+          tag: {
+            deletedAt: null as Date | null,
           },
         },
-        integration: {
-          select: {
-            id: true,
-            providerIdentifier: true,
-            name: true,
-            picture: true,
-          },
+        select: {
+          tag: true,
         },
       },
-    });
+      integration: {
+        select: {
+          id: true,
+          providerIdentifier: true,
+          name: true,
+          picture: true,
+        },
+      },
+    };
 
-    return list
-      .map((post) => ({ ...post, error: this.curatedError(post.error) }))
-      .reduce((all, post) => {
-      if (!post.intervalInDays) {
-        return [...all, post];
+    // The posts of the range and the repeating posts are loaded separately: as
+    // one query ("in the range OR repeating") PostgreSQL can't use the
+    // [organizationId, publishDate] index and reads every post of the
+    // organization from disk, whatever the range is.
+    const [inRange, repeating] = await Promise.all([
+      this._post.model.post.findMany({
+        where: {
+          ...whereBase,
+          publishDate: {
+            gte: startDate,
+            lte: endDate,
+          },
+          intervalInDays: null,
+        },
+        select,
+      }),
+      this._post.model.post.findMany({
+        where: {
+          ...whereBase,
+          intervalInDays: {
+            not: null,
+          },
+        },
+        select,
+      }),
+    ]);
+
+    const list = [...inRange, ...repeating];
+
+    // This runs on the request thread, so keep it linear: push into one array
+    // (spreading the accumulator on every post was quadratic and blocked the
+    // event loop for seconds on large orgs), and expand repeating posts only
+    // inside [startDate, endDate] instead of from their first publish date.
+    const rangeStart = dayjs.utc(startDate);
+    const rangeEnd = dayjs.utc(endDate);
+    const result: any[] = [];
+
+    for (const row of list) {
+      const post = { ...row, error: this.curatedError(row.error) };
+      if (!post.intervalInDays || post.intervalInDays < 1) {
+        result.push(post);
+        continue;
       }
 
-      const addMorePosts = [];
-      let startingDate = dayjs.utc(post.publishDate);
-      while (dayjs.utc(endDate).isSameOrAfter(startingDate)) {
-        if (dayjs(startingDate).isSameOrAfter(dayjs.utc(post.publishDate))) {
-          addMorePosts.push({
-            ...post,
-            publishDate: startingDate.toDate(),
-            actualDate: post.publishDate,
-          });
-        }
-
-        startingDate = startingDate.add(post.intervalInDays, 'days');
+      const firstDate = dayjs.utc(post.publishDate);
+      let occurrence = firstDate;
+      if (rangeStart.isAfter(firstDate)) {
+        const skip = Math.ceil(
+          rangeStart.diff(firstDate, 'day', true) / post.intervalInDays
+        );
+        occurrence = firstDate.add(skip * post.intervalInDays, 'day');
       }
 
-      return [...all, ...addMorePosts];
-    }, [] as any[]);
+      while (!occurrence.isAfter(rangeEnd)) {
+        result.push({
+          ...post,
+          publishDate: occurrence.toDate(),
+          actualDate: post.publishDate,
+        });
+        occurrence = occurrence.add(post.intervalInDays, 'day');
+      }
+    }
+
+    return result;
   }
 
   async getPostsList(orgId: string, query: GetPostsListDto) {
@@ -393,8 +453,8 @@ export class PostsRepository {
     });
   }
 
-  getPostsByGroup(orgId: string, group: string) {
-    return this._post.model.post.findMany({
+  async getPostsByGroup(orgId: string, group: string) {
+    const posts = await this._post.model.post.findMany({
       where: {
         group,
         ...(orgId ? { organizationId: orgId } : {}),
@@ -414,6 +474,8 @@ export class PostsRepository {
         },
       },
     });
+
+    return Promise.all(posts.map((p) => this.decryptIntegration(p)));
   }
 
   // the posts of the other channels in the batch, without the given group
@@ -436,13 +498,13 @@ export class PostsRepository {
     });
   }
 
-  getPost(
+  async getPost(
     id: string,
     includeIntegration = false,
     orgId?: string,
     isFirst?: boolean
   ) {
-    return this._post.model.post.findUnique({
+    const post = await this._post.model.post.findUnique({
       where: {
         id,
         ...(orgId ? { organizationId: orgId } : {}),
@@ -467,6 +529,8 @@ export class PostsRepository {
         childrenPost: true,
       },
     });
+
+    return this.decryptIntegration(post);
   }
 
   updatePost(id: string, postId: string, releaseURL: string) {
@@ -948,8 +1012,8 @@ export class PostsRepository {
     });
   }
 
-  getPostById(id: string, org?: string) {
-    return this._post.model.post.findUnique({
+  async getPostById(id: string, org?: string) {
+    const post = await this._post.model.post.findUnique({
       where: {
         id,
         ...(org ? { organizationId: org } : {}),
@@ -974,6 +1038,8 @@ export class PostsRepository {
         },
       },
     });
+
+    return this.decryptIntegration(post);
   }
 
   private get postTimelineSelect() {

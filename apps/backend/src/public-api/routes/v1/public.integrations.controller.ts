@@ -37,6 +37,7 @@ import { VideoFunctionDto } from '@gitroom/nestjs-libraries/dtos/videos/video.fu
 import { UploadDto } from '@gitroom/nestjs-libraries/dtos/media/upload.dto';
 import { GetMediaDto } from '@gitroom/nestjs-libraries/dtos/media/get.media.dto';
 import { ClippingDto } from '@gitroom/nestjs-libraries/dtos/clipping/clipping.dto';
+import { ConnectLinkDto } from '@gitroom/nestjs-libraries/dtos/integrations/connect.link.dto';
 import { ClippingService } from '@gitroom/nestjs-libraries/database/prisma/clipping/clipping.service';
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notifications/get.notifications.dto';
@@ -380,7 +381,18 @@ export class PublicIntegrationsController {
         await integrationProvider.generateAuthUrl();
 
       if (refresh) {
-        await ioRedis.set(`refresh:${state}`, refresh, 'EX', 3600);
+        // The callback matches the channel by its provider account id, while
+        // API callers only know the integration id.
+        const existing = await this._integrationService.getIntegrationById(
+          org.id,
+          refresh
+        );
+        await ioRedis.set(
+          `refresh:${state}`,
+          existing?.internalId || refresh,
+          'EX',
+          3600
+        );
       }
 
       await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
@@ -389,6 +401,31 @@ export class PublicIntegrationsController {
       return { url };
     } catch (err) {
       throw new HttpException({ msg: 'Failed to generate auth URL' }, 500);
+    }
+  }
+
+  // Unlike /social/:integration, the URL is a Postiz page: the person reads
+  // what connecting the channel means before they are sent to the platform.
+  // The channel limit is checked again when they continue from that page
+  @Post('/integrations/connect')
+  @CheckPolicies([AuthorizationActions.Create, Sections.CHANNEL])
+  async createConnectLink(
+    @GetOrgFromRequest() org: Organization,
+    @Body() body: ConnectLinkDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    try {
+      return await this._integrationService.createConnectLink(
+        org.id,
+        body.integration,
+        body.redirectUrl
+      );
+    } catch (err) {
+      // Refused integrations keep this route's { msg } error shape
+      if (err instanceof HttpException) {
+        throw new HttpException({ msg: err.message }, err.getStatus());
+      }
+      throw err;
     }
   }
 

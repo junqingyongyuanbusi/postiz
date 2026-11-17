@@ -6,6 +6,10 @@ import useSWR from 'swr';
 import { orderBy } from 'lodash';
 import clsx from 'clsx';
 import SafeImage from '@gitroom/react/helpers/safe.image';
+import {
+  isBrandMark,
+  PlatformIcon,
+} from '@gitroom/frontend/components/ui/platform.icon.component';
 import { AddProviderComponent } from '@gitroom/frontend/components/launches/add.provider.component';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { useModals } from '@gitroom/frontend/components/layout/new-modal';
@@ -186,7 +190,16 @@ const OnboardingStep1: FC<{ onNext: () => void; onSkip: () => void }> = ({
                 key={integration.id}
                 className="flex items-center gap-[8px] bg-customColor47/30 rounded-[8px] px-[12px] py-[8px]"
               >
-                <div className="relative w-[28px] h-[28px]">
+                {/* a brand mark is bigger than this avatar: it sits next to
+                    it, on the chip (see isBrandMark) */}
+                <div
+                  className={clsx(
+                    'relative',
+                    isBrandMark(integration.identifier)
+                      ? 'flex items-center gap-[8px]'
+                      : 'w-[28px] h-[28px]'
+                  )}
+                >
                   <SafeImage
                     src={integration.picture}
                     className="rounded-full"
@@ -194,12 +207,15 @@ const OnboardingStep1: FC<{ onNext: () => void; onSkip: () => void }> = ({
                     width={28}
                     height={28}
                   />
-                  <SafeImage
-                    src={`/icons/platforms/${integration.identifier}.png`}
-                    className="rounded-full absolute -bottom-[3px] -end-[3px] border border-fifth"
-                    alt={integration.identifier}
-                    width={14}
-                    height={14}
+                  <PlatformIcon
+                    identifier={integration.identifier}
+                    size={14}
+                    channel={integration.internalId}
+                    className={clsx(
+                      !isBrandMark(integration.identifier) &&
+                        'absolute -bottom-[3px] -end-[3px]'
+                    )}
+                    iconClassName="rounded-full border border-fifth"
                   />
                 </div>
                 <span className="text-[13px]">{integration.name}</span>

@@ -42,8 +42,12 @@ import { timer } from '@gitroom/helpers/utils/timer';
 import { useUser } from '@gitroom/frontend/components/layout/user.context';
 import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
 import isSameOrBefore from 'dayjs/plugin/isSameOrBefore';
-import { groupBy, sortBy } from 'lodash';
+import { groupBy, sortBy, uniqBy } from 'lodash';
 import SafeImage from '@gitroom/react/helpers/safe.image';
+import {
+  isBrandMark,
+  PlatformIcon,
+} from '@gitroom/frontend/components/ui/platform.icon.component';
 import { extend } from 'dayjs';
 import { isUSCitizen } from './helpers/isuscitizen.utils';
 import { StatisticsModal } from '@gitroom/frontend/components/launches/statistics';
@@ -408,7 +412,10 @@ const DaySlotColumn: FC<{ option: any[]; startDate: string }> = memo(
       <CalendarContext.Provider
         value={{
           ...calendar,
-          integrations: option.flatMap((p) => p.integration),
+          integrations: uniqBy(
+            option.flatMap((p) => p.integration),
+            (p) => p.id
+          ),
         }}
       >
         <CalendarColumn getDate={slotDate(startDate, option[0].time)} />
@@ -436,9 +443,9 @@ export const DayView = () => {
       .map((post) => {
         const date = postDates.get(post);
         return {
-          integration: [
-            integrations.find((i) => i.id === post.integration.id)!,
-          ],
+          integration: integrations.filter(
+            (i) => i.id === post.integration.id
+          ),
           image: post?.integration?.picture || '',
           identifier: post?.integration?.providerIdentifier || '',
           id: post?.integration?.id || '',
@@ -836,6 +843,7 @@ export const CalendarColumn: FC<{
       // Find the post to check its state
       const post = posts.find((p) => p.id === item.id);
       let action: 'schedule' | 'update' = 'schedule';
+      let republish = false;
 
       // Check if post is already published or queued in the past
       if (
@@ -902,6 +910,7 @@ export const CalendarColumn: FC<{
           return;
         }
         action = whatToDo;
+        republish = action === 'schedule';
       }
 
       if (!item.interval) {
@@ -912,9 +921,7 @@ export const CalendarColumn: FC<{
         body: JSON.stringify({
           date: getDate.utc().format('YYYY-MM-DDTHH:mm:ss'),
           action,
-          // published posts always confirm via the modal before reaching here;
-          // for QUEUE posts the flag is a no-op on the server
-          ...(action === 'schedule' ? { republish: true } : {}),
+          ...(republish ? { republish } : {}),
         }),
       });
       if (status !== 500) {
@@ -1145,12 +1152,18 @@ export const CalendarColumn: FC<{
               )}
               {display === 'day' && (
                 <div
-                  className={`w-full h-full rounded-[10px] py-[10px] flex-wrap hover:border hover:border-seventh flex justify-center items-center gap-[20px] mobile:gap-[12px] opacity-30 grayscale hover:grayscale-0 hover:opacity-100`}
+                  className={`group/day w-full h-full rounded-[10px] py-[10px] flex-wrap hover:border hover:border-seventh flex justify-center items-center gap-[20px] mobile:gap-[12px]`}
                 >
+                  {/* the channels are faded until the slot is hovered, a brand
+                      mark can't be: it only shows with the hover (see isBrandMark) */}
                   {integrations.map((selectedIntegrations) => (
                     <div
-                      className="relative"
-                      key={selectedIntegrations.identifier}
+                      className={clsx(
+                        'relative',
+                        !isBrandMark(selectedIntegrations.identifier) &&
+                          'opacity-30 grayscale group-hover/day:grayscale-0 group-hover/day:opacity-100'
+                      )}
+                      key={selectedIntegrations.id}
                     >
                       <div
                         className={clsx(
@@ -1161,26 +1174,22 @@ export const CalendarColumn: FC<{
                           src={
                             selectedIntegrations.picture || '/no-picture.jpg'
                           }
-                          className="rounded-[8px]"
+                          className={clsx(
+                            'rounded-[8px]',
+                            isBrandMark(selectedIntegrations.identifier) &&
+                              'opacity-30 grayscale group-hover/day:grayscale-0 group-hover/day:opacity-100'
+                          )}
                           alt={selectedIntegrations.identifier}
                           width={32}
                           height={32}
                         />
-                        {selectedIntegrations.identifier === 'youtube' ? (
-                          <img
-                            src="/icons/platforms/youtube.svg"
-                            className="absolute z-10 -bottom-[5px] -end-[5px]"
-                            width={20}
-                          />
-                        ) : (
-                          <SafeImage
-                            src={`/icons/platforms/${selectedIntegrations.identifier}.png`}
-                            className="rounded-[8px] absolute z-10 -bottom-[5px] -end-[5px] border border-fifth"
-                            alt={selectedIntegrations.identifier}
-                            width={20}
-                            height={20}
-                          />
-                        )}
+                        <PlatformIcon
+                          identifier={selectedIntegrations.identifier}
+                          size={20}
+                          className="absolute z-10 -bottom-[5px] -end-[5px]"
+                          iconClassName="rounded-[8px] border border-fifth"
+                          markClassName="bg-newBgColorInner hidden group-hover/day:flex"
+                        />
                       </div>
                     </div>
                   ))}
@@ -1233,6 +1242,7 @@ const CalendarItem: FC<{
   } = props;
   const { disableXAnalytics } = useVariables();
   const user = useUser();
+  const brandMark = isBrandMark(post.integration?.providerIdentifier);
   const showCreationMethodBadge =
     user?.impersonate &&
     post.creationMethod &&
@@ -1345,7 +1355,7 @@ const CalendarItem: FC<{
               <OpenPost />
             </div>
           )}{' '}
-        {((post.integration.providerIdentifier === 'x' && disableXAnalytics) || !post.releaseId) ? (
+        {((post.integration.providerIdentifier === 'x' && disableXAnalytics) || !post.releaseId || (state !== 'PUBLISHED' && state !== 'ERROR')) ? (
           <></>
         ) : post.releaseId === 'missing' && missingRelease ? (
           <div
@@ -1405,23 +1415,46 @@ const CalendarItem: FC<{
           'relative',
           display === 'month' &&
             'mobile:p-[4px] mobile:rounded-[10px] mobile:justify-center',
-          isBeforeNow && '!grayscale'
+          isBeforeNow && !brandMark && '!grayscale'
         )}
       >
-        <div className={clsx('relative min-w-[20px]')}>
+        {/* a past post is grayed out as a whole, a brand mark can't be: its
+            avatar, text and time are instead (see isBrandMark). It is also
+            bigger than this avatar, so it sits under it and not on it (above
+            the now line, z-[15]), and the avatar-only cards of the phone month
+            view go without it */}
+        <div
+          className={clsx(
+            'relative min-w-[20px]',
+            brandMark && 'flex flex-col items-start gap-[3px] shrink-0'
+          )}
+        >
           <img
-            className="w-[20px] h-[20px] rounded-[8px]"
+            className={clsx(
+              'w-[20px] h-[20px] rounded-[8px]',
+              isBeforeNow && brandMark && '!grayscale'
+            )}
             src={post.integration.picture! || '/no-picture.jpg'}
           />
-          <img
-            className="w-[12px] h-[12px] rounded-[8px] absolute z-10 top-[10px] end-0 border border-fifth"
-            src={`/icons/platforms/${post.integration?.providerIdentifier}.png`}
+          <PlatformIcon
+            identifier={post.integration?.providerIdentifier}
+            size={12}
+            inactive={isBeforeNow}
+            className={clsx(
+              brandMark ? 'relative z-[16]' : 'absolute z-10 top-[10px] end-0'
+            )}
+            iconClassName="w-[12px] h-[12px] rounded-[8px] border border-fifth"
+            markClassName={clsx(
+              'bg-newColColor',
+              display === 'month' && 'mobile:hidden'
+            )}
           />
         </div>
         <div
           className={clsx(
             'w-full flex-1 flex flex-col min-h-[40px]',
-            display === 'month' && 'mobile:hidden'
+            display === 'month' && 'mobile:hidden',
+            isBeforeNow && brandMark && '!grayscale'
           )}
         >
           <div className="text-start">
@@ -1435,7 +1468,12 @@ const CalendarItem: FC<{
             </div>
         </div>
         {showTime && (
-          <div className="text-textColor/50 text-[12px] whitespace-nowrap flex items-center">
+          <div
+            className={clsx(
+              'text-textColor/50 text-[12px] whitespace-nowrap flex items-center',
+              isBeforeNow && brandMark && '!grayscale'
+            )}
+          >
             {fromUtc(post.publishDate).format(isUSCitizen() ? 'hh:mm A' : 'HH:mm')}
           </div>
         )}
